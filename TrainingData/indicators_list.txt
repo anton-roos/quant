@@ -1,0 +1,40 @@
+date - The specific date of the trading day or data point
+close - The closing price of the security at the end of the trading day
+YesterdayClose - The closing price from the previous trading day
+YesterdayOpenLogR - Log return calculated from yesterday's opening price
+YesterdayHighLogR - Log return calculated from yesterday's high price
+YesterdayLowLogR - Log return calculated from yesterday's low price
+YesterdayVolumeLogR - Log return calculated from yesterday's trading volume
+YesterdayCloseLogR - Log return calculated from yesterday's closing price
+MA10 - 10-day moving average of the closing price
+MA20 - 20-day moving average of the closing price
+MA30 - 30-day moving average of the closing price
+DayOfWeek - Numerical representation of the day of the week (1-7)
+DayOfMonth - The day number within the month (1-31)
+MonthNumber - The month number within the year (1-12)
+EMA10 - 10-day exponential moving average, giving more weight to recent prices
+EMA30 - 30-day exponential moving average, giving more weight to recent prices
+RSI - Relative Strength Index, a momentum oscillator measuring overbought/oversold conditions (0-100)
+MACD - Moving Average Convergence Divergence, a trend-following momentum indicator
+MACD_Signal - The signal line for MACD, typically a 9-day EMA of the MACD line
+BollingerUpper - Upper band of Bollinger Bands, showing potential resistance levels
+BollingerLower - Lower band of Bollinger Bands, showing potential support levels
+Volatility_10 - 10-day volatility measure, indicating price fluctuation intensity
+Volatility_20 - 20-day volatility measure, indicating price fluctuation intensity
+Volatility_30 - 30-day volatility measure, indicating price fluctuation intensity
+OBV - On-Balance Volume, combining price and volume to show buying/selling pressure
+ZScore - Statistical measure showing how many standard deviations away from the mean
+insider_shares - Number of shares involved in insider trading activities
+insider_amount - Dollar amount of insider trading transactions
+insider_buy_flag - Binary indicator (1/0) showing whether insider activity was buying
+sentiment - Market sentiment score, likely derived from news or social media analysis
+num_articles - Number of news articles or mentions related to the security
+overnight_gap - Price difference between previous close and current open
+abnormal_vol - Indicator of whether trading volume is abnormally high compared to average
+volatility_5d - 5-day rolling volatility measure
+volatility_20d - 20-day rolling volatility measure
+momentum_5d - 5-day price momentum indicator
+momentum_20d - 20-day price momentum indicator
+skew_5d - 5-day price skewness, measuring asymmetry in price distribution
+intraday_range - The difference between the day's high and low prices
+sentiment_change - Change in sentiment score compared to previous period
