@@ -4,12 +4,33 @@ import os
 import time
 from datetime import datetime, timedelta
 
-API_KEY = '' #Real api key here alphavantage
 RAW_STOCKS_DIR = 'TrainingData/indicators_data/raw/stocksData'
 SENTIMENT_DIR = 'TrainingData/indicators_data/raw/sentiment'
 os.makedirs(SENTIMENT_DIR, exist_ok=True)
 
+def load_api_key():
+    #Load AlphaVantage API key from config.json
+    import json, os
 
+    try:
+        with open("config.json", "r") as f:
+            cfg = json.load(f)
+            key = cfg.get("ALPHA_VANTAGE_KEY")
+
+            if key is None or key.strip() == "":
+                raise ValueError(
+                    "\nERROR: Your AlphaVantage API key is missing.\n"
+                    "Open config.json and add:\n"
+                    '{ "ALPHA_VANTAGE_KEY": "YOUR_KEY_HERE" }\n'
+                )
+            return key
+
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            "\nERROR: config.json is missing.\n"
+            "Create it (or copy config.example.json) and add your API key.\n"
+        )
+    
 def get_date_range_from_csv(csv_path):
     df = pd.read_csv(csv_path, parse_dates=['date'])
     df = df.sort_values('date')
@@ -25,7 +46,7 @@ def get_last_sentiment_date(sentiment_path):
         return None
     return df['date'].max()
 
-def fetch_sentiment_for_range(ticker, start_date, end_date, sentiment_path):
+def fetch_sentiment_for_range(ticker, start_date, end_date, sentiment_path, API_KEY):
     # Load existing sentiment if present
     if os.path.exists(sentiment_path):
         sentiment_df = pd.read_csv(sentiment_path, parse_dates=['date'])
@@ -153,7 +174,7 @@ def main():
 
         percent = (idx / total) * 100
         print(f"[{idx}/{total}] ({percent:.1f}%) Fetching sentiment for {ticker} from {fetch_start.date()} to {stock_end.date()}")
-        fetch_sentiment_for_range(ticker, fetch_start, stock_end, sentiment_csv_path)
+        fetch_sentiment_for_range(ticker, fetch_start, stock_end, sentiment_csv_path, API_KEY)
         print(f"Completed fetching sentiment for {ticker}")
         
 
@@ -175,6 +196,7 @@ def main():
     print("All tickers processed.")
 
 if __name__ == "__main__":
+    API_KEY = load_api_key() 
     start_time = time.time()
     main()
     elapsed = time.time() - start_time

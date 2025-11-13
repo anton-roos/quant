@@ -3,7 +3,7 @@ import pandas as pd
 import os
 import time
 from datetime import datetime
-
+import json
 def update_or_create_csv(ticker, ts, save_folder, delay_sec=1):
     if not os.path.exists(save_folder):
         os.makedirs(save_folder)
@@ -44,8 +44,29 @@ def update_or_create_csv(ticker, ts, save_folder, delay_sec=1):
     except Exception as e:
         print(f" Failed to download {ticker}: {e}")
 
+def load_api_key():
+    try:
+        with open("config.json", "r") as f:
+            cfg = json.load(f)
+            key = cfg.get("ALPHA_VANTAGE_KEY")
+            
+            if key is None or key.strip() == "":
+                raise ValueError(
+                    "\nERROR: Your AlphaVantage API key is missing.\n"
+                    "Please open config.json and set:\n"
+                    '{ "ALPHA_VANTAGE_KEY": "YOUR_KEY_HERE" }\n'
+                )
+            return key
+
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            "\nERROR: config.json is missing.\n"
+            "Create a config.json file in the project folder with:\n"
+            '{ "ALPHA_VANTAGE_KEY": "YOUR_KEY_HERE" }\n'
+        )
+    
 if __name__ == "__main__":
-    api_key = ""  # Replace with your actual key
+    api_key = load_api_key()#""  # Replace with your actual key
     tickers = ["SPY", "VIXY"]  # S&P 500 and VIX
     save_folder = "TrainingData/indicators_data/raw/SPY-VIX"
     delay_seconds = 0.8  # Alpha Vantage free tier = 5 API calls/min

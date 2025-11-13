@@ -2,6 +2,7 @@ from alpha_vantage.timeseries import TimeSeries
 import pandas as pd
 import os
 import time
+import json
 
 def download_alpha_vantage_daily(tickers, api_key, save_folder="TrainingData/indicators_data/raw/stocksData", delay_sec=1):
     if not os.path.exists(save_folder):
@@ -70,10 +71,30 @@ def download_alpha_vantage_daily(tickers, api_key, save_folder="TrainingData/ind
         except Exception as e:
             print(f" Error downloading {ticker}: {e}")
 
+def load_api_key():
+    #Load AlphaVantage API key from config.json, with error checking.
+    try:
+        with open("config.json", "r") as f:
+            cfg = json.load(f)
+            key = cfg.get("ALPHA_VANTAGE_KEY")
 
+            if key is None or key.strip() == "":
+                raise ValueError(
+                    "\nERROR: Your AlphaVantage API key is missing.\n"
+                    "Open config.json and add your key:\n"
+                    '{ "ALPHA_VANTAGE_KEY": "YOUR_KEY_HERE" }\n'
+                )
+
+            return key
+
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            "\nERROR: config.json is missing.\n"
+            "Create it (or copy config.example.json) and add your API key.\n"
+        )
+    
 if __name__ == "__main__":
-    api_key = ""#Real Api key for alphavantage
-    #Enter path to stock list .csv here
+    api_key = load_api_key()
     with open(r'\stockList.csv', 'r') as file:
         tickers = [line.strip() for line in file if line.strip()]
 
