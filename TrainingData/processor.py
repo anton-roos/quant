@@ -8,7 +8,6 @@ and place them in the indicators_data/processed folder.txt
 import os
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler,MinMaxScaler
 
 RAW_DIR = "TrainingData/indicators_data/raw"
 PROCESSED_DIR = "TrainingData/indicators_data/processed"
@@ -214,6 +213,9 @@ def main():
         os.makedirs(processed_subdir, exist_ok=True)
 
         for file in os.listdir(raw_subdir):
+            if file.startswith("._"):
+                print(f"[Skipping] macOS metadata: {file}")
+                continue
             if file.endswith(".csv"):
                 raw_file_path = os.path.join(raw_subdir, file)
                 processed_file_path = os.path.join(processed_subdir, f"{os.path.splitext(file)[0]}_processed.csv")

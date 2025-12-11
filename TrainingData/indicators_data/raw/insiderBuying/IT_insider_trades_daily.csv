@@ -1,4 +1,4 @@
-date,shares,amount,buy_flag
+cncdate,shares,amount,buy_flag
 2003-08-19,40000.0,413400.0,1
 2003-08-20,7200.0,73080.0,1
 2003-08-21,14200.0,145290.0,1

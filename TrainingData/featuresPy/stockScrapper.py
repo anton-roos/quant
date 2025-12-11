@@ -95,7 +95,7 @@ def load_api_key():
     
 if __name__ == "__main__":
     api_key = load_api_key()
-    with open(r'\stockList.csv', 'r') as file:
+    with open(r'TrainingData\stockList.csv', 'r') as file:
         tickers = [line.strip() for line in file if line.strip()]
 
     print(tickers)
