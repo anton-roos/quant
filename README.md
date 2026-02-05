@@ -1,113 +1,163 @@
-# AI Stock Predictor
+# AI Market Predictor
 
-A deep learning pipeline for forecasting short-term stock market movements using price indicators, Monte Carlo dropout uncertainty estimation, and walk-forward validation.
+A deep learning pipeline for forecasting short-term market movements in **Forex, Indices, Commodities, and Crypto** using price indicators, Monte Carlo dropout uncertainty estimation, and walk-forward validation.
 
 # Overview
 
 This project builds an end-to-end machine learning pipeline that:
 
-- Loads and processes stock indicator data from CSV files
+- Loads and processes market data for 65+ trading instruments from MT5 Bridge
+- Supports Forex pairs, major indices, commodities, and cryptocurrencies
 - Generates normalized training windows
 - Trains a Conv1D + LSTM model with Monte Carlo dropout
 - Uses uncertainty to determine confidence in predictions
-- Outputs buy/hold forecasts to the /forecasts folder
+- Outputs buy/hold forecasts to the outputs/forecasts/ folder
 
-The design emphasizes realistic backtesting, uncertainty-aware predictions, and ease of extension — ideal for research, education, or algorithmic-trading experimentation.
+The design emphasizes realistic backtesting, uncertainty-aware predictions, and ease of extension — ideal for research, education, or algorithmic-trading experimentation with multiple asset classes.
 ```
-├── forecasts/                  # Model forecast CSV outputs
-├── cache/                      # Cached preprocessed numpy arrays
-├── TrainingData/
-│   ├── indicators_data/
-│   │   ├── raw/                # Raw scraped data (price, sentiment, insider)
-│   │   └── processed/
-│   │       ├── SPY-VIX/        # Market indicators
-│   │       └── stocksData/     # Stock CSVs (one per ticker)
-│   ├── featuresPy/             # Feature-generation scripts
-│   ├── processor.py            # Main feature pipeline
-│   └── downloader.py           # Data download helpers
-├── forecast.ipynb              # Jupyter notebook for running forecasts
-├── forecasting_backtest_Predictor.py  # Main training & backtest script
-├── forecasting_backtest_Predictor_v2.py # Newer version with attention/uncertainty
-├── videos/                     # Rendered content for visualization or YouTube
+├── src/
+│   ├── inference/              # Forecasting & backtesting
+│   │   ├── run_forecast.py     # Main forecasting script
+│   │   └── run_backtest.py     # Backtesting script
+│   ├── data/                   # Data processing pipeline
+│   │   ├── processor.py        # Main feature pipeline
+│   │   ├── downloader.py       # Data download orchestrator
+│   │   ├── features/           # Feature generation scripts
+│   │   │   └── mt5_bridge_downloader.py
+│   │   └── indicators_data/
+│   │       ├── raw/            # Raw data (forex, indices, commodities, crypto)
+│   │       └── processed/      # Processed features
+│   ├── models/                 # Model definitions
+│   ├── utils/                  # Shared utilities
+│   └── mt5_bridge/             # MT5 API integration
+│
+├── config/
+│   ├── symbols.json            # 65 tradeable instruments
+│   └── config.json             # Runtime configuration
+│
+├── outputs/
+│   ├── forecasts/              # Model forecast CSV outputs
+│   ├── videos/                 # Backtest visualizations
+│   └── models/                 # Saved model checkpoints
+│
+├── notebooks/                  # Jupyter notebooks
+├── tests/                      # Test suite
 └── README.md
 ```
 
+## **Supported Markets**
+
+**65+ Trading Instruments across 4 asset classes:**
+
+- 🪙 **Forex (44 pairs)**: EURUSD, GBPUSD, USDJPY, AUDUSD, and 40 more
+- 📊 **Indices (10)**: S&P 500, Nasdaq 100, DAX 30, FTSE 100, Nikkei 225, etc.
+- ⛏️ **Commodities (5)**: Gold, Silver, Crude Oil (Brent & WTI), Natural Gas
+- ₿ **Crypto (4)**: Bitcoin, Ethereum, Litecoin, Bitcoin Cash
+
+All data is sourced from **MT5 Bridge API** which connects to MetaTrader 5.
+
 ## **Available Features (Indicators)**
 
-`close, YesterdayClose, YesterdayOpenLogR, YesterdayHighLogR, YesterdayLowLogR, YesterdayVolumeLogR, YesterdayCloseLogR, MA10, MA20, MA30, DayOfWeek, DayOfMonth, MonthNumber, EMA10, EMA30, RSI, MACD, MACD_Signal, BollingerUpper, BollingerLower, Volatility_10, Volatility_20, Volatility_30, OBV, ZScore, insider_shares, insider_amount, insider_buy_flag, sentiment, num_articles, overnight_gap, abnormal_vol, volatility_5d, volatility_20d, momentum_5d, momentum_20d, skew_5d, intraday_range, sentiment_change`
+Technical indicators computed for each instrument:
 
-Each is automatically merged, cleaned, and normalized during preprocessing.
+`close, YesterdayClose, YesterdayOpenLogR, YesterdayHighLogR, YesterdayLowLogR, YesterdayVolumeLogR, YesterdayCloseLogR, MA10, MA20, MA30, DayOfWeek, DayOfMonth, MonthNumber, EMA10, EMA30, RSI, MACD, MACD_Signal, BollingerUpper, BollingerLower, Volatility_10, Volatility_20, Volatility_30, OBV, ZScore, overnight_gap, abnormal_vol, volatility_5d, volatility_20d, momentum_5d, momentum_20d, skew_5d, intraday_range`
+
+Each is automatically computed, cleaned, and normalized during preprocessing.
 
 ---
-
-Key Features
-FeatureDescriptionConv1D + LSTM ArchitectureLearns short- and long-term dependencies in stock dataMonte Carlo DropoutProduces uncertainty estimates for each forecastWalk-Forward ValidationPrevents data leakage, simulates real-time tradingRegime and Volatility AwarenessDetects market conditions for more robust signalsBatch Data GeneratorLoads multiple stock datasets efficiently from cacheForecast Confidence ThresholdTrades only when confidence > threshold (default 0.7)
 
 ## Key Features
 
 | Feature | Description |
 |----------|-------------|
-| **Conv1D + LSTM Architecture** | Learns short- and long-term dependencies in stock data |
+| **Conv1D + LSTM Architecture** | Learns short- and long-term dependencies in market data |
 | **Monte Carlo Dropout** | Produces uncertainty estimates for each forecast |
 | **Walk-Forward Validation** | Prevents data leakage, simulates real-time trading |
-| **Regime and Volatility Awareness** | Detects market conditions for more robust signals |
-| **Batch Data Generator** | Loads multiple stock datasets efficiently from cache |
+| **Multi-Asset Support** | Forex, Indices, Commodities, and Crypto |
+| **MT5 Integration** | Direct connection to MetaTrader 5 via REST API |
+| **Batch Data Generator** | Loads multiple instruments efficiently from cache |
 | **Forecast Confidence Threshold** | Trades only when confidence > threshold (default 0.7) |
 
 ## Getting Started
 
-### 1. Requirements
+### 1. Prerequisites
+
+- Python 3.9+
+- MetaTrader 5 terminal (for live data)
+- MT5 Bridge API running (see `src/mt5_bridge/README.md`)
+
+### 2. Installation
 
 Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
-### 2. Training & Generating Predictions
 
-The *forecast.ipynb* file is used to train the model, based on the list of processed stocks in */TrainingData/indicators_data/processed/stocksData/*. There is a sample of limited stocks already included in the package, however, more data could be added. 
+### 3. Setup MT5 Bridge
 
-### 3. Creating Historical Datasets (Optional)
-
-If you want to generate your own datasets from scratch:
-
-#### Step 1: Configure AlphaVantage API Key
-
-The `downloader.py` script uses **AlphaVantage** as the primary data source for historical stock prices and market data. To access this data, you'll need a free API key:
-
-1. Sign up for a free API key at [https://www.alphavantage.co/support/#api-key](https://www.alphavantage.co/support/#api-key)
-2. Open `TrainingData/downloader.py` in a text editor
-3. Locate the API key configuration section near the top of the file
-4. Replace the placeholder with your API key:
-   ```python
-   ALPHAVANTAGE_API_KEY = "your_api_key_here"
-   ```
-5. Save the file
-
-**Note:** AlphaVantage's free tier has rate limits (typically 5 API calls per minute and 500 calls per day). The downloader script includes built-in rate limiting to respect these constraints.
-
-#### Step 2: Run `TrainingData/downloader.py`
+Start the MT5 Bridge API server:
 
 ```bash
-python TrainingData/downloader.py
+cd src/mt5_bridge
+python -m uvicorn src.main:app --host 127.0.0.1 --port 8787
 ```
 
-This script will:
-- Download historical price data from AlphaVantage
-- Fetch sentiment data and insider trading information from SEC EDGAR and other sources
-- Store raw data in `/TrainingData/indicators_data/raw/`
+See [src/mt5_bridge/README.md](src/mt5_bridge/README.md) for detailed setup instructions.
 
-#### Step 3: Run `TrainingData/processor.py`
+### 4. Download Market Data
+
+Download historical data for all 65 instruments:
 
 ```bash
-python TrainingData/processor.py
+python src/data/downloader.py
 ```
 
-This script will:
-- Clean and merge raw data
-- Compute all technical indicators
-- Output final processed CSVs to: `/TrainingData/indicators_data/processed/stocksData/`
+This will fetch 2 years of daily data for:
+- 44 Forex pairs
+- 10 Major indices
+- 5 Commodities
+- 4 Cryptocurrencies
 
----
+### 5. Process Data
 
-![Backtest Example](images/image1.PNG)
+Process raw data and compute technical indicators:
+
+```bash
+python src/data/processor.py
+```
+
+### 6. Run Forecasts
+
+Generate predictions for all instruments:
+
+```bash
+python src/inference/run_forecast.py
+```
+
+### 7. Run Backtests
+
+Visualize and analyze backtest performance:
+
+```bash
+python src/inference/run_backtest.py
+```
+
+## Customizing Symbols
+
+Edit `config/symbols.json` to add/remove trading instruments. The file is organized by asset type (Forex, Index, Commodity, Crypto) and includes MetaTrader 5 symbol names and paths.
+
+## Features & Indicators
+
+All technical indicators are computed automatically during data processing:
+
+- **Price Action**: Moving averages (MA10, MA20, MA30), EMAs (10, 30)
+- **Momentum**: RSI, MACD, Momentum (5d, 20d)
+- **Volatility**: Bollinger Bands, Realized volatility (5d, 20d, 30d), Intraday range
+- **Volume**: OBV (On-Balance Volume), Abnormal volume z-score
+- **Statistical**: Z-Score, Skewness (5d)
+- **Temporal**: Day of week, Day of month, Month number
+
+## Project Structure
+
+See [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) for detailed documentation.

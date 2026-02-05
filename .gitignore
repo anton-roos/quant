@@ -1,5 +1,30 @@
-cache/
-forecasts/
-videos/
-sec-edgar-filings/
-config.json
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Data (too large for git)
+src/data/indicators_data/raw/
+src/data/indicators_data/processed/
+
+# Outputs
+outputs/forecasts/
+outputs/videos/
+outputs/models/
+outputs/cache/
+
+# Config with secrets
+config/config.json
+
+# MT5 Bridge logs
+src/mt5_bridge/logs/
+src/mt5_bridge/.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

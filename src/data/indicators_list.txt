@@ -1,0 +1,43 @@
+# Technical Indicators for Market Forecasting
+# Supports: Forex, Indices, Commodities, Crypto
+# Automatically computed by src/data/processor.py
+
+date - The specific date of the trading day or data point
+close - The closing price of the instrument at the end of the trading day
+YesterdayClose - The closing price from the previous trading day
+YesterdayOpenLogR - Log return calculated from yesterday's opening price
+YesterdayHighLogR - Log return calculated from yesterday's high price
+YesterdayLowLogR - Log return calculated from yesterday's low price
+YesterdayVolumeLogR - Log return calculated from yesterday's trading volume (0 for forex)
+YesterdayCloseLogR - Log return calculated from yesterday's closing price
+MA10 - 10-day moving average of the closing price
+MA20 - 20-day moving average of the closing price
+MA30 - 30-day moving average of the closing price
+DayOfWeek - Numerical representation of the day of the week (0=Monday, 6=Sunday)
+DayOfMonth - The day number within the month (1-31)
+MonthNumber - The month number within the year (1-12)
+EMA10 - 10-day exponential moving average, giving more weight to recent prices
+EMA30 - 30-day exponential moving average, giving more weight to recent prices
+RSI - Relative Strength Index, a momentum oscillator measuring overbought/oversold conditions (0-100)
+MACD - Moving Average Convergence Divergence, a trend-following momentum indicator
+MACD_Signal - The signal line for MACD, typically a 9-day EMA of the MACD line
+BollingerUpper - Upper band of Bollinger Bands, showing potential resistance levels
+BollingerLower - Lower band of Bollinger Bands, showing potential support levels
+Volatility_10 - 10-day volatility measure, indicating price fluctuation intensity
+Volatility_20 - 20-day volatility measure, indicating price fluctuation intensity
+Volatility_30 - 30-day volatility measure, indicating price fluctuation intensity
+OBV - On-Balance Volume, combining price and volume to show buying/selling pressure (0 for forex)
+ZScore - Statistical measure showing how many standard deviations away from the 20-day mean
+overnight_gap - Price difference between previous close and current open (%)
+abnormal_vol - Z-score of volume vs 20-day average (0 for forex)
+volatility_5d - 5-day realized volatility (annualized)
+volatility_20d - 20-day realized volatility (annualized)
+momentum_5d - 5-day price momentum (% return)
+momentum_20d - 20-day price momentum (% return)
+skew_5d - 5-day price skewness, measuring asymmetry in return distribution
+intraday_range - The difference between the day's high and low prices (normalized by close)
+
+# Notes:
+# - Volume indicators (OBV, abnormal_vol) are set to 0 for forex pairs (volume not meaningful)
+# - All other indicators work across all asset classes (Forex, Indices, Commodities, Crypto)
+# - Date is preserved in processed files for time-series ordering

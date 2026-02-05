@@ -1,0 +1,532 @@
+{
+  "description": "Tradeable symbols: Forex pairs, Indices, Commodities, and Crypto",
+  "symbols": [
+    {
+      "name": "AUDCAD",
+      "description": "AUDCAD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\AUDCAD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "AUDCHF",
+      "description": "AUDCHF",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\AUDCHF",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "AUDJPY",
+      "description": "AUDJPY",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\AUDJPY",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "AUDNZD",
+      "description": "AUDNZD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\AUDNZD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "AUDUSD",
+      "description": "AUDUSD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\AUDUSD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "Australia 200",
+      "description": "Australia 200",
+      "type": "Index",
+      "path": "CFDs\\International Markets\\Index\\Australia 200",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "Bitcoin (BTCUSD)",
+      "description": "Bitcoin (BTCUSD)",
+      "type": "Crypto",
+      "path": "CFDs\\Crypto\\Bitcoin (BTCUSD)",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "Bitcoin Cash (XBNUSD)",
+      "description": "Bitcoin Cash (XBNUSD)",
+      "type": "Crypto",
+      "path": "CFDs\\Crypto\\Bitcoin Cash (XBNUSD)",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "Brent Crude Oil",
+      "description": "Brent Crude Oil",
+      "type": "Commodity",
+      "path": "CFDs\\International Markets\\Commodity\\Brent Crude Oil",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "CAC 40",
+      "description": "CAC 40",
+      "type": "Index",
+      "path": "CFDs\\International Markets\\Index\\CAC 40",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "CADCHF",
+      "description": "CADCHF",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\CADCHF",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "CADJPY",
+      "description": "CADJPY",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\CADJPY",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "CHFJPY",
+      "description": "CHFJPY",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\CHFJPY",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "DAX 30",
+      "description": "DAX 30",
+      "type": "Index",
+      "path": "CFDs\\International Markets\\Index\\DAX 30",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "DJ Euro Stoxx 50",
+      "description": "DJ Euro Stoxx 50",
+      "type": "Index",
+      "path": "CFDs\\International Markets\\Index\\DJ Euro Stoxx 50",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "EURAUD",
+      "description": "EURAUD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\EURAUD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "EURCAD",
+      "description": "EURCAD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\EURCAD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "EURCHF",
+      "description": "EURCHF",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\EURCHF",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "EURCZK",
+      "description": "EURCZK",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\EURCZK",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "EURGBP",
+      "description": "EURGBP",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\EURGBP",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "EURJPY",
+      "description": "EURJPY",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\EURJPY",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "EURMXN",
+      "description": "EURMXN",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\EURMXN",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "EURNZD",
+      "description": "EURNZD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\EURNZD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "EURSGD",
+      "description": "EURSGD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\EURSGD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "EURTRY",
+      "description": "EURTRY",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\EURTRY",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "EURUSD",
+      "description": "EURUSD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\EURUSD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "Ethereum (ETHUSD)",
+      "description": "Ethereum (ETHUSD)",
+      "type": "Crypto",
+      "path": "CFDs\\Crypto\\Ethereum (ETHUSD)",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "FTSE 100",
+      "description": "FTSE 100",
+      "type": "Index",
+      "path": "CFDs\\International Markets\\Index\\FTSE 100",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "GBPAUD",
+      "description": "GBPAUD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\GBPAUD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "GBPCAD",
+      "description": "GBPCAD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\GBPCAD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "GBPCHF",
+      "description": "GBPCHF",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\GBPCHF",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "GBPJPY",
+      "description": "GBPJPY",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\GBPJPY",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "GBPMXN",
+      "description": "GBPMXN",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\GBPMXN",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "GBPNOK",
+      "description": "GBPNOK",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\GBPNOK",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "GBPNZD",
+      "description": "GBPNZD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\GBPNZD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "GBPSEK",
+      "description": "GBPSEK",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\GBPSEK",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "GBPSGD",
+      "description": "GBPSGD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\GBPSGD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "GBPTRY",
+      "description": "GBPTRY",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\GBPTRY",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "GBPUSD",
+      "description": "GBPUSD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\GBPUSD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "Gold",
+      "description": "Gold",
+      "type": "Commodity",
+      "path": "CFDs\\International Markets\\Commodity\\Gold",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "Hang Seng 50",
+      "description": "Hang Seng 50",
+      "type": "Index",
+      "path": "CFDs\\International Markets\\Index\\Hang Seng 50",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "Litecoin (LTCUSD)",
+      "description": "Litecoin (LTCUSD)",
+      "type": "Crypto",
+      "path": "CFDs\\Crypto\\Litecoin (LTCUSD)",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "NOKSEK",
+      "description": "NOKSEK",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\NOKSEK",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "NZDCAD",
+      "description": "NZDCAD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\NZDCAD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "NZDCHF",
+      "description": "NZDCHF",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\NZDCHF",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "NZDJPY",
+      "description": "NZDJPY",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\NZDJPY",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "NZDSGD",
+      "description": "NZDSGD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\NZDSGD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "NZDUSD",
+      "description": "NZDUSD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\NZDUSD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "Nasdaq 100",
+      "description": "Nasdaq 100",
+      "type": "Index",
+      "path": "CFDs\\International Markets\\Index\\Nasdaq 100",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "Natural Gas",
+      "description": "Natural Gas",
+      "type": "Commodity",
+      "path": "CFDs\\International Markets\\Commodity\\Natural Gas",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "Nikkei 225",
+      "description": "Nikkei 225",
+      "type": "Index",
+      "path": "CFDs\\International Markets\\Index\\Nikkei 225",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "Nymex Light Crude",
+      "description": "Nymex Light Crude",
+      "type": "Commodity",
+      "path": "CFDs\\International Markets\\Commodity\\Nymex Light Crude",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "S&P 500",
+      "description": "S&P 500",
+      "type": "Index",
+      "path": "CFDs\\International Markets\\Index\\S&P 500",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "Silver",
+      "description": "Silver",
+      "type": "Commodity",
+      "path": "CFDs\\International Markets\\Commodity\\Silver",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "USDCAD",
+      "description": "USDCAD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\USDCAD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "USDCHF",
+      "description": "USDCHF",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\USDCHF",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "USDCNH",
+      "description": "USDCNH",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\USDCNH",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "USDJPY",
+      "description": "USDJPY",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\USDJPY",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "USDMXN",
+      "description": "USDMXN",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\USDMXN",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "USDNOK",
+      "description": "USDNOK",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\USDNOK",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "USDSEK",
+      "description": "USDSEK",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\USDSEK",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "USDSGD",
+      "description": "USDSGD",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\USDSGD",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "USDTRY",
+      "description": "USDTRY",
+      "type": "Forex",
+      "path": "CFDs\\International Markets\\Currency\\PP\\USDTRY",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    },
+    {
+      "name": "USDZAR",
+      "description": "USD/ZAR Indicator Only",
+      "type": "Forex",
+      "path": "CFDs\\Indicator Only\\USDZAR",
+      "currency_base": "USD",
+      "currency_profit": "ZAR"
+    },
+    {
+      "name": "Wall Street 30",
+      "description": "Wall Street 30",
+      "type": "Index",
+      "path": "CFDs\\International Markets\\Index\\Wall Street 30",
+      "currency_base": "INT",
+      "currency_profit": "INT"
+    }
+  ],
+  "count": 65,
+  "categories": {
+    "Forex": 44,
+    "Index": 10,
+    "Commodity": 5,
+    "Crypto": 4
+  }
+}
