@@ -6,10 +6,15 @@ Supports: Forex pairs, Indices, Commodities, and Crypto
 """
 
 import os
+import warnings
 import pandas as pd
 import numpy as np
 from pathlib import Path
 from datetime import datetime
+
+# Suppress harmless divide-by-zero warnings from log operations on zero volume
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*divide by zero.*')
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*invalid value.*')
 
 # Use paths relative to this file's location
 SCRIPT_DIR = Path(__file__).parent
@@ -26,12 +31,15 @@ def process_file(csv_path, output_path):
     df["YesterdayHighLogR"]  = np.log(df["high"] / df["high"].shift(1))
     df["YesterdayLowLogR"]   = np.log(df["low"]  / df["low"].shift(1))
     
-    # Handle missing volume (common for forex/commodities)
-    has_volume = "volume" in df.columns and df["volume"].notna().any()
+    # Handle missing volume (common for forex/commodities/crypto)
+    has_volume = "volume" in df.columns and df["volume"].notna().any() and (df["volume"] != 0).any()
     if not has_volume:
         df["volume"] = 0  # Set to 0 if missing
     
-    df["YesterdayVolumeLogR"] = np.log(df["volume"] / df["volume"].shift(1))
+    if has_volume:
+        df["YesterdayVolumeLogR"] = np.log(df["volume"] / df["volume"].shift(1))
+    else:
+        df["YesterdayVolumeLogR"] = 0
     df["YesterdayCloseLogR"] = np.log(df["close"] / df["YesterdayClose"])
 
     df["MA10"] = df["close"].rolling(window=10).mean()

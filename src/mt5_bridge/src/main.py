@@ -72,7 +72,6 @@ async def lifespan(app: FastAPI):
     else:
         state.logger.error(f"MT5 initialization failed: {result.error_message}")
     state.logger.info(f"Bridge listening on {settings.bridge_host}:{settings.bridge_port}")
-    state.logger.warning("⚠️  PURE BRIDGE MODE - NO RISK MANAGEMENT OR VALIDATION ⚠️")
     yield
     state.logger.info("Shutting down MT5 Bridge...")
     if state.mt5_client:
@@ -223,7 +222,7 @@ async def get_quote(symbol: str):
             detail="MT5 not initialized"
         )
     
-    result = state.mt5_client.get_quote(symbol.upper())
+    result = state.mt5_client.get_quote(symbol)
     
     if not result.success:
         state.jsonl_logger.log_request(
@@ -261,7 +260,7 @@ async def get_positions(symbol: Optional[str] = None):
             detail="MT5 not initialized"
         )
     
-    result = state.mt5_client.get_positions(symbol.upper() if symbol else None)
+    result = state.mt5_client.get_positions(symbol if symbol else None)
     
     if not result.success:
         state.jsonl_logger.log_request(
@@ -570,7 +569,7 @@ async def get_candles(
             )
     
     result = state.mt5_client.get_candles(
-        symbol=symbol.upper(),
+        symbol=symbol,
         timeframe=timeframe.upper(),
         count=min(count, 50000),  # Cap at 50000
         from_date=parsed_date
@@ -615,7 +614,7 @@ async def get_symbol_info(symbol: str):
             detail="MT5 not initialized"
         )
     
-    result = state.mt5_client.get_symbol_info(symbol.upper())
+    result = state.mt5_client.get_symbol_info(symbol)
     
     if not result.success:
         state.jsonl_logger.log_request(
@@ -675,7 +674,7 @@ async def get_deals_history(
     result = state.mt5_client.get_deals_history(
         from_date=parsed_from,
         to_date=parsed_to,
-        symbol=symbol.upper() if symbol else None
+        symbol=symbol if symbol else None
     )
     
     if not result.success:
@@ -736,7 +735,7 @@ async def get_orders_history(
     result = state.mt5_client.get_orders_history(
         from_date=parsed_from,
         to_date=parsed_to,
-        symbol=symbol.upper() if symbol else None
+        symbol=symbol if symbol else None
     )
     
     if not result.success:
@@ -796,7 +795,7 @@ async def get_ticks(
             )
     
     result = state.mt5_client.get_ticks(
-        symbol=symbol.upper(),
+        symbol=symbol,
         count=min(count, 100000),
         from_date=parsed_date
     )
@@ -814,7 +813,7 @@ async def get_rsi(symbol: str, period: int = 14, timeframe: str = "H1", count: i
         raise HTTPException(status_code=503, detail="MT5 not initialized")
     
     # Get candles
-    candles_result = state.mt5_client.get_candles(symbol.upper(), timeframe.upper(), count + period)
+    candles_result = state.mt5_client.get_candles(symbol, timeframe.upper(), count + period)
     if not candles_result.success:
         raise HTTPException(status_code=500, detail=candles_result.error_message)
     
@@ -838,7 +837,7 @@ async def get_macd(symbol: str, fast: int = 12, slow: int = 26, signal: int = 9,
     if not state.mt5_client or not state.mt5_client.is_initialized():
         raise HTTPException(status_code=503, detail="MT5 not initialized")
     
-    candles_result = state.mt5_client.get_candles(symbol.upper(), timeframe.upper(), count + slow + signal)
+    candles_result = state.mt5_client.get_candles(symbol, timeframe.upper(), count + slow + signal)
     if not candles_result.success:
         raise HTTPException(status_code=500, detail=candles_result.error_message)
     
@@ -870,7 +869,7 @@ async def get_bollinger_bands(symbol: str, period: int = 20, deviation: float = 
     if not state.mt5_client or not state.mt5_client.is_initialized():
         raise HTTPException(status_code=503, detail="MT5 not initialized")
     
-    candles_result = state.mt5_client.get_candles(symbol.upper(), timeframe.upper(), count + period)
+    candles_result = state.mt5_client.get_candles(symbol, timeframe.upper(), count + period)
     if not candles_result.success:
         raise HTTPException(status_code=500, detail=candles_result.error_message)
     
@@ -904,7 +903,7 @@ async def get_moving_average(symbol: str, period: int = 50, ma_type: str = "SMA"
     if ma_type.upper() not in ["SMA", "EMA"]:
         raise HTTPException(status_code=400, detail="ma_type must be SMA or EMA")
     
-    candles_result = state.mt5_client.get_candles(symbol.upper(), timeframe.upper(), count + period)
+    candles_result = state.mt5_client.get_candles(symbol, timeframe.upper(), count + period)
     if not candles_result.success:
         raise HTTPException(status_code=500, detail=candles_result.error_message)
     
@@ -930,7 +929,7 @@ async def get_atr(symbol: str, period: int = 14, timeframe: str = "H1", count: i
     if not state.mt5_client or not state.mt5_client.is_initialized():
         raise HTTPException(status_code=503, detail="MT5 not initialized")
     
-    candles_result = state.mt5_client.get_candles(symbol.upper(), timeframe.upper(), count + period)
+    candles_result = state.mt5_client.get_candles(symbol, timeframe.upper(), count + period)
     if not candles_result.success:
         raise HTTPException(status_code=500, detail=candles_result.error_message)
     
@@ -1085,7 +1084,7 @@ async def websocket_ticks(websocket: WebSocket, symbol: str):
         return
     
     # Ensure symbol is selected
-    select_result = state.mt5_client.symbol_select(symbol.upper())
+    select_result = state.mt5_client.symbol_select(symbol)
     if not select_result.success:
         await websocket.send_json({
             "error": f"Symbol {symbol} not found"
@@ -1100,14 +1099,14 @@ async def websocket_ticks(websocket: WebSocket, symbol: str):
         
         while True:
             # Get latest tick
-            tick = mt5.symbol_info_tick(symbol.upper())
+            tick = mt5.symbol_info_tick(symbol)
             
             if tick and tick.time > last_tick_time:
                 last_tick_time = tick.time
                 
                 # Send tick data
                 tick_data = {
-                    "symbol": symbol.upper(),
+                    "symbol": symbol,
                     "time": datetime.fromtimestamp(tick.time, tz=pytz.UTC).isoformat(),
                     "bid": tick.bid,
                     "ask": tick.ask,

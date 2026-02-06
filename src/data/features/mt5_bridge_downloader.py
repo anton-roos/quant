@@ -16,11 +16,34 @@ Usage:
 import requests
 import pandas as pd
 import os
+import re
 from datetime import datetime, timedelta
 import json
-import time
 from typing import List, Optional, Dict
 from pathlib import Path
+
+
+def _sanitize_filename(symbol: str) -> str:
+    """
+    Convert an MT5 symbol name to a safe, clean filename.
+    
+    Examples:
+        "EURUSD"              -> "EURUSD"
+        "Bitcoin (BTCUSD)"    -> "BTCUSD"
+        "Brent Crude Oil"     -> "Brent_Crude_Oil"
+        "S&P 500"             -> "SP500"
+        "DJ Euro Stoxx 50"    -> "DJ_Euro_Stoxx_50"
+    """
+    # If the name contains a parenthesized ticker like "Bitcoin (BTCUSD)", extract it
+    match = re.search(r'\(([A-Z0-9]+)\)', symbol)
+    if match:
+        return match.group(1)
+    
+    # Otherwise sanitize: replace & with nothing, spaces with _, strip non-alphanumeric
+    name = symbol.replace("&", "").strip()
+    name = re.sub(r'\s+', '_', name)
+    name = re.sub(r'[^A-Za-z0-9_]', '', name)
+    return name
 
 class MT5BridgeDownloader:
     """Download historical data from MT5 Bridge API."""
@@ -29,7 +52,6 @@ class MT5BridgeDownloader:
         self,
         bridge_host: str = "127.0.0.1",
         bridge_port: int = 8787,
-        api_key: str = None,
         save_folder: str = "src/data/indicators_data/raw"
     ):
         """
@@ -38,44 +60,15 @@ class MT5BridgeDownloader:
         Args:
             bridge_host: MT5 Bridge host (default: 127.0.0.1)
             bridge_port: MT5 Bridge port (default: 8787)
-            api_key: API key for bridge authentication (load from .env if None)
             save_folder: Where to save CSV files
         """
         self.base_url = f"http://{bridge_host}:{bridge_port}"
-        self.api_key = api_key or self._load_api_key()
         self.save_folder = save_folder
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}" if self.api_key else None
-        }
-        
-        if self.headers["Authorization"] is None:
-            self.headers.pop("Authorization")
-    
-    def _load_api_key(self) -> Optional[str]:
-        """Load API key from .env or mt5_bridge/.env"""
-        try:
-            # Try mt5_bridge directory first
-            if os.path.exists("mt5_bridge/.env"):
-                with open("mt5_bridge/.env", "r") as f:
-                    for line in f:
-                        if line.startswith("API_KEY="):
-                            return line.split("=", 1)[1].strip()
-            
-            # Then try root .env
-            if os.path.exists(".env"):
-                with open(".env", "r") as f:
-                    for line in f:
-                        if line.startswith("API_KEY="):
-                            return line.split("=", 1)[1].strip()
-        except Exception as e:
-            print(f"⚠️  Warning: Could not load API key: {e}")
-        
-        return None
     
     def health_check(self) -> bool:
         """Check if MT5 Bridge is healthy."""
         try:
-            response = requests.get(f"{self.base_url}/health", headers=self.headers, timeout=5)
+            response = requests.get(f"{self.base_url}/health", timeout=5)
             if response.status_code == 200:
                 print(f"✅ MT5 Bridge is UP: {self.base_url}")
                 return True
@@ -104,7 +97,6 @@ class MT5BridgeDownloader:
             print(f"📊 Fetching available symbols (group={group})...")
             response = requests.get(
                 f"{self.base_url}/symbols",
-                headers=self.headers,
                 params={"group": group},
                 timeout=30
             )
@@ -127,7 +119,6 @@ class MT5BridgeDownloader:
         symbols: List[str],
         save_folder: Optional[str] = None,
         days_back: int = 365,
-        delay_sec: float = 0.5
     ) -> None:
         """
         Download daily (D1) candle data for multiple symbols.
@@ -136,7 +127,6 @@ class MT5BridgeDownloader:
             symbols: List of symbols to download
             save_folder: Where to save. Defaults to self.save_folder
             days_back: How many days of history to retrieve
-            delay_sec: Delay between requests (to respect rate limits)
         """
         save_folder = save_folder or self.save_folder
         
@@ -150,12 +140,9 @@ class MT5BridgeDownloader:
         for i, symbol in enumerate(symbols, 1):
             self._download_symbol(symbol, save_folder, days_back)
             
-            # Progress & ETA
             if i < len(symbols):
                 percent = (i / len(symbols)) * 100
                 print(f"   Progress: {percent:.1f}% ({i}/{len(symbols)})")
-                print(f"   Waiting {delay_sec}s to respect rate limits...")
-                time.sleep(delay_sec)
         
         print(f"\n✅ Download complete!")
     
@@ -166,7 +153,8 @@ class MT5BridgeDownloader:
         days_back: int
     ) -> None:
         """Download data for a single symbol."""
-        filepath = os.path.join(save_folder, f"{symbol}_daily.csv")
+        safe_name = _sanitize_filename(symbol)
+        filepath = os.path.join(save_folder, f"{safe_name}_daily.csv")
         
         try:
             # Check if file exists and is up-to-date
@@ -176,7 +164,7 @@ class MT5BridgeDownloader:
                 
                 # If latest date is today, skip
                 if pd.to_datetime(last_date).date() >= pd.Timestamp.now().date():
-                    print(f"⏭️  {symbol:12} already up-to-date (latest: {last_date.date()})")
+                    print(f"⏭️  {safe_name:20} already up-to-date (latest: {last_date.date()})")
                     return
                 
                 # Only fetch new data since last_date
@@ -186,11 +174,10 @@ class MT5BridgeDownloader:
                 from_date = (datetime.now() - timedelta(days=days_back)).isoformat()
             
             # Fetch candles from MT5 Bridge
-            print(f"📥 {symbol:12} fetching from {from_date.split('T')[0]}...", end=" ")
+            print(f"📥 {safe_name:20} fetching from {from_date.split('T')[0]}...", end=" ")
             
             response = requests.get(
                 f"{self.base_url}/candles",
-                headers=self.headers,
                 params={
                     "symbol": symbol,
                     "timeframe": "D1",
