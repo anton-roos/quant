@@ -38,6 +38,8 @@ from sklearn.preprocessing import StandardScaler
 import glob
 import shutil
 import time
+import pickle
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -53,11 +55,12 @@ logger = logging.getLogger(__name__)
 CONFIG = {
     "DATA_DIR": Path("src/data/indicators_data/processed"),
     "FORECAST_DIR": Path("outputs/forecasts"),
+    "MODEL_DIR": Path("outputs/models"),
     "CACHE_DIR": Path("outputs/cache"),
     "WINDOW_SIZE": 90,
     "TRAIN_VAL_FRAC": 0.8,
     "VAL_FRAC_WITHIN_TRAIN": 0.2,
-    "MC_DROPOUT_SAMPLES": 25,
+    "MC_DROPOUT_SAMPLES": 50,
     "EXCLUDED_COLS": ["date", "Target_1d", "Target_1w", "Target_1m", "Target_6m"],
     "PROB_THRESHOLD": 0.7,
     "RANDOM_SEED": RANDOM_SEED
@@ -68,6 +71,7 @@ horizon_days = [1, 5, 21, 126]
 
 # Ensure dirs exist
 CONFIG["FORECAST_DIR"].mkdir(exist_ok=True)
+CONFIG["MODEL_DIR"].mkdir(exist_ok=True)
 CONFIG["CACHE_DIR"].mkdir(exist_ok=True)
 
 # Globals
@@ -97,13 +101,15 @@ def mc_dropout_predict(model, X, n_samples=50):
 # ============================================================================
 
 def compute_horizon_thresholds(df):
-    """Compute required return thresholds for each horizon (2 sigma above average)"""
-    thresholds = {}
+    """Compute required return thresholds for each horizon (2 sigma above/below average)"""
+    thresholds_up = {}
+    thresholds_down = {}
     for h in ["1d", "1w", "1m", "6m"]:
         mu = df[f"Target_{h}"].mean()
         sig = df[f"Target_{h}"].std()
-        thresholds[h] = mu + 2 * sig
-    return thresholds
+        thresholds_up[h] = mu + 2 * sig
+        thresholds_down[h] = mu - 2 * sig
+    return thresholds_up, thresholds_down
 
 
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -122,12 +128,13 @@ def process_instrument(csv_path: Path, for_training=True):
     df = pd.read_csv(csv_path, parse_dates=["date"]).sort_values("date").reset_index(drop=True)
     df = add_features(df)
 
-    # Compute thresholds
-    thresholds = compute_horizon_thresholds(df)
+    # Compute thresholds (upside and downside)
+    thresholds_up, thresholds_down = compute_horizon_thresholds(df)
 
-    # Create binary classification targets
+    # Create binary classification targets (upside and downside)
     for h in ["1d", "1w", "1m", "6m"]:
-        df[f"Class_{h}"] = (df[f"Target_{h}"] > thresholds[h]).astype(int)
+        df[f"Class_{h}"] = (df[f"Target_{h}"] > thresholds_up[h]).astype(int)
+        df[f"Class_{h}_down"] = (df[f"Target_{h}"] < thresholds_down[h]).astype(int)
         
     if df.empty:
         return np.array([]), np.array([]), df, np.array([])
@@ -139,7 +146,8 @@ def process_instrument(csv_path: Path, for_training=True):
 
     features_scaled = scaler.transform(df[feature_cols].values)
     dates = df["date"].values
-    target = df[["Class_1d", "Class_1w", "Class_1m", "Class_6m"]].values if for_training else None
+    target = df[["Class_1d", "Class_1w", "Class_1m", "Class_6m",
+                  "Class_1d_down", "Class_1w_down", "Class_1m_down", "Class_6m_down"]].values if for_training else None
 
     X, y, y_dates = [], [], []
     window = CONFIG["WINDOW_SIZE"]
@@ -303,9 +311,14 @@ def make_forecast(model, X, dates, closes, horizons, horizon_days):
     y_pred_mean, y_pred_std, _ = mc_dropout_predict(model, X, n_samples=CONFIG["MC_DROPOUT_SAMPLES"])
     df_dict = {"Date": dates, "Close": closes}
 
+    n_horizons = len(horizons)
     for i, h in enumerate(horizons):
+        # Upside probabilities (first 4 outputs)
         df_dict[f"Pred_Prob_{h}"] = y_pred_mean[:, i]
-        df_dict[f"Pred_Prob_Std_{h}"] = y_pred_std[:, i]   
+        df_dict[f"Pred_Prob_Std_{h}"] = y_pred_std[:, i]
+        # Downside probabilities (last 4 outputs)
+        df_dict[f"Pred_Prob_Down_{h}"] = y_pred_mean[:, n_horizons + i]
+        df_dict[f"Pred_Prob_Down_Std_{h}"] = y_pred_std[:, n_horizons + i]
 
     forecasting_df = pd.DataFrame(df_dict)
     return forecasting_df
@@ -447,27 +460,66 @@ def main():
     
     n_features = len(feature_cols)
     model = Sequential([
-        Conv1D(32, kernel_size=3, activation="relu", 
+        # Temporal convolution to capture local patterns
+        Conv1D(64, kernel_size=3, activation="relu", padding="same",
                input_shape=(CONFIG["WINDOW_SIZE"] + 1, n_features)),
         BatchNormalization(),
         MCDropout(0.3),
-        LSTM(64, return_sequences=False), 
+        
+        # Second conv layer for higher-level patterns
+        Conv1D(32, kernel_size=3, activation="relu", padding="same"),
+        BatchNormalization(),
+        MCDropout(0.2),
+        
+        # Stacked LSTMs for long-range dependencies
+        LSTM(128, return_sequences=True),
         MCDropout(0.3),
+        LSTM(64, return_sequences=False),
+        MCDropout(0.3),
+        
+        # Dense head
+        Dense(64, activation="relu"),
+        BatchNormalization(),
+        MCDropout(0.2),
         Dense(32, activation="relu"),
-        Dense(4, activation="sigmoid")  # Four time horizon predictions
+        Dense(8, activation="sigmoid")  # 4 upside + 4 downside horizon predictions
     ])
 
     early_stop = EarlyStopping(
-        patience=25,
+        patience=30,
         monitor="val_loss",
         restore_best_weights=True,
         mode="min",
     )
 
+    reduce_lr = ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.5,
+        patience=10,
+        min_lr=1e-6,
+        verbose=1,
+    )
+
     model.compile(optimizer="adam", loss="binary_crossentropy", metrics=[AUC(name="auc")])
     
     logger.info("Training model...")
-    history = model.fit(train_gen, validation_data=val_gen, callbacks=[early_stop], epochs=500, verbose=1)
+    history = model.fit(train_gen, validation_data=val_gen, callbacks=[early_stop, reduce_lr], epochs=500, verbose=1)
+
+    # ========================================================================
+    # STEP 4b: Save model, scaler, and feature_cols for live trading
+    # ========================================================================
+    logger.info("Step 4b: Saving model artifacts for live trading...")
+    
+    model.save(CONFIG["MODEL_DIR"] / "lstm_model.keras")
+    logger.info(f"Saved model to {CONFIG['MODEL_DIR'] / 'lstm_model.keras'}")
+    
+    with open(CONFIG["MODEL_DIR"] / "scaler.pkl", "wb") as f:
+        pickle.dump(scaler, f)
+    logger.info(f"Saved scaler to {CONFIG['MODEL_DIR'] / 'scaler.pkl'}")
+    
+    with open(CONFIG["MODEL_DIR"] / "feature_cols.json", "w") as f:
+        json.dump(feature_cols, f)
+    logger.info(f"Saved feature_cols to {CONFIG['MODEL_DIR'] / 'feature_cols.json'}")
 
     # Save training history plot
     plt.figure(figsize=(10, 6))
