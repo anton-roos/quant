@@ -150,8 +150,9 @@ class MT5BridgeDownloader:
                     print(f"⏭️  {safe_name:20} already up-to-date (latest: {last_date.date()})")
                     return
                 
-                # Only fetch new data since last_date
-                from_date = (last_date + timedelta(days=1)).isoformat()
+                # Fetch from the last known date (not +1 day) to avoid
+                # weekend/holiday gaps causing "no data" errors. We de-dup on merge.
+                from_date = pd.to_datetime(last_date).to_pydatetime().isoformat()
             else:
                 # Fetch historical data
                 from_date = (datetime.now() - timedelta(days=days_back)).isoformat()
@@ -171,7 +172,10 @@ class MT5BridgeDownloader:
             )
             
             if response.status_code != 200:
-                print(f"❌ HTTP {response.status_code}")
+                body = (response.text or "").strip().replace("\n", " ")
+                body_preview = (body[:200] + "…") if len(body) > 200 else body
+                suffix = f" – {body_preview}" if body_preview else ""
+                print(f"❌ HTTP {response.status_code}{suffix}")
                 return
             
             data = response.json()

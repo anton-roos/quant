@@ -593,16 +593,26 @@ async def get_candles(
     )
     
     if not result.success:
+        status_code = (
+            400 if result.error_code == ErrorCode.INVALID_PARAMETER else
+            404 if result.error_code == ErrorCode.SYMBOL_NOT_FOUND else
+            500
+        )
         state.jsonl_logger.log_request(
             endpoint="/candles",
             method="GET",
-            request_data={"symbol": symbol, "timeframe": timeframe, "count": count},
+            request_data={
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "count": count,
+                "from_date": from_date,
+            },
             response_data={},
-            status_code=400 if result.error_code == ErrorCode.INVALID_PARAMETER else 500,
+            status_code=status_code,
             error=result.error_message
         )
         raise HTTPException(
-            status_code=400 if result.error_code == ErrorCode.INVALID_PARAMETER else 500,
+            status_code=status_code,
             detail=result.error_message
         )
     

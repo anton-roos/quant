@@ -14,8 +14,7 @@ outputs/videos/
 outputs/models/
 outputs/cache/
 outputs/bot_logs/
-
-
+outputs/bridge_logs/
 
 # MT5 Bridge logs
 src/mt5_bridge/logs/

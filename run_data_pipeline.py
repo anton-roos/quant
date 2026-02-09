@@ -33,7 +33,8 @@ def run_download():
     print("\n" + "=" * 60)
     print(" STEP 0: Downloading market data")
     print("=" * 60)
-    from src.data.downloader import *  # noqa: F401,F403 – executes download on import
+    from src.data.downloader import main as download_main
+    download_main()
 
 
 def run_training():
