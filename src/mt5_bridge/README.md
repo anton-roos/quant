@@ -28,8 +28,9 @@ Broker
 
 ### 1. Install Dependencies
 
+Dependencies are in the project root `requirements.txt`. From the repo root:
+
 ```powershell
-cd trader
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt

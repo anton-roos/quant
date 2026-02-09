@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Launch the LSTM trading bot.
+Launch the LSTM trading bot (live trading).
+
+Pre-requisites:
+    1. python run_data_pipeline.py   – train model & generate forecasts
+    2. python run_bridge.py          – start the MT5 bridge server
 
 Usage (from project root):
     python run_bot.py

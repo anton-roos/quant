@@ -79,21 +79,14 @@ The full list lives in `config/symbols.json`.
 
 ## Installation
 
-### 1. Clone the repository
-
-```powershell
-git clone https://github.com/<your-user>/LSTM_AI_Stock_Predictor.git
-cd LSTM_AI_Stock_Predictor
-```
-
-### 2. Create a virtual environment
+### 1. Create a virtual environment
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-### 3. Install main dependencies
+### 2. Install main dependencies
 
 ```powershell
 pip install -r requirements.txt
@@ -101,7 +94,7 @@ pip install -r requirements.txt
 
 This installs: TensorFlow, Keras, scikit-learn, NumPy, pandas, SciPy, Matplotlib, Pillow, requests, python-dotenv, tqdm.
 
-### 4. Install MT5 Bridge dependencies
+### 3. Install MT5 Bridge dependencies
 
 The bridge has its own requirements (FastAPI, uvicorn, MetaTrader5 package, etc.):
 

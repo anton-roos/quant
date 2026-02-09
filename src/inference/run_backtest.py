@@ -7,6 +7,7 @@ Usage:
     python -m src.inference.run_backtest          # run with defaults
     bt = Backtester(); bt.run(); bt.print_summary()  # programmatic
 """
+import json
 import os
 import sys
 import pandas as pd
@@ -43,15 +44,25 @@ DEFAULT_PERIODS = {
 @dataclass
 class BacktestConfig:
     """All tuneable knobs for the backtester, matching live bot defaults."""
-    initial_value: float = 1.0
+    initial_value: float = 2000.0      # Starting equity in ZAR
     random_runs: int = 50
     min_accepted: float = 0.50
     std_factor: float = 1.0
     max_concurrent: int = 3
     slippage_bps: float = 5.0
     swap_bps_per_day: float = 1.5
+    # Risk-based position sizing (mirrors live bot's compute_lot_size)
+    risk_per_trade_pct: float = 1.0
+    risk_per_type: Dict[str, float] = field(default_factory=lambda: {
+        "Index": 1.0, "Forex": 0.75, "Crypto": 0.5, "Commodity": 1.0,
+    })
+    atr_sl_multiplier: float = 2.0
+    atr_period: int = 14
+    max_alloc_per_trade: float = 5.0   # Max leverage per single trade
+    global_max_risk_pct: float = 5.0   # Total portfolio risk cap
     periods: Dict[str, int] = field(default_factory=lambda: dict(DEFAULT_PERIODS))
     project_root: Path = field(default_factory=lambda: Path(os.getcwd()))
+    symbols_path: Path = field(default_factory=lambda: Path("config/symbols.json"))
 
 
 class Backtester:
@@ -89,6 +100,9 @@ class Backtester:
         self.random_mean: Optional[np.ndarray] = None
         self.random_std: Optional[np.ndarray] = None
 
+        # Symbol type mapping (loaded from symbols.json)
+        self.symbol_types: Dict[str, str] = {}
+
         # Computed metrics
         self.metrics: Dict[str, float] = {}
 
@@ -114,10 +128,15 @@ class Backtester:
                     df[f"Actual_LogR_{label}"] = np.log(
                         df["Close"].shift(-days) / df["Close"]
                     )
+                # ATR proxy from close-to-close absolute changes
+                df["_ATR"] = df["Close"].diff().abs().rolling(
+                    window=self.cfg.atr_period, min_periods=1,
+                ).mean()
             self.all_forecasts[symbol] = df
 
         print(f"\nLoaded {len(self.all_forecasts)} symbols (no spike filter applied)")
         self._build_common_dates()
+        self._load_symbol_types()
         return len(self.all_forecasts)
 
     def _build_common_dates(self):
@@ -127,6 +146,68 @@ class Backtester:
         all_dates = [set(df.index) for df in self.all_forecasts.values()]
         self.common_dates = sorted(set.union(*all_dates))
         print(f"\nUsing {len(self.common_dates)} dates across {len(self.all_forecasts)} symbols")
+
+    def _load_symbol_types(self):
+        """Build symbol→type mapping from symbols.json for risk-per-type lookup."""
+        symbols_path = self.cfg.project_root / self.cfg.symbols_path
+        if not symbols_path.exists():
+            print(f"  symbols.json not found at {symbols_path}, defaulting all to Forex")
+            return
+
+        with open(symbols_path) as f:
+            data = json.load(f)
+
+        # Build lookup: multiple key variants → instrument type
+        name_to_type: Dict[str, str] = {}
+        for entry in data.get("symbols", []):
+            name = entry["name"]
+            sym_type = entry.get("type", "Forex")
+            name_to_type[name] = sym_type
+            name_to_type[name.replace(" ", "_")] = sym_type
+            # Extract ticker from parentheses, e.g. "BTCUSD" from "Bitcoin (BTCUSD)"
+            if "(" in name and ")" in name:
+                ticker = name.split("(")[1].split(")")[0]
+                name_to_type[ticker] = sym_type
+
+        for forecast_sym in self.all_forecasts:
+            base = forecast_sym.replace("_daily_processed", "")
+            if base in name_to_type:
+                self.symbol_types[forecast_sym] = name_to_type[base]
+            else:
+                self.symbol_types[forecast_sym] = "Forex"  # safe default
+
+        typed_counts: Dict[str, int] = {}
+        for t in self.symbol_types.values():
+            typed_counts[t] = typed_counts.get(t, 0) + 1
+        print(f"  Symbol types: {typed_counts}")
+
+    def _compute_trade_allocation(self, symbol: str, date, close: float) -> float:
+        """Compute risk-based allocation fraction for a trade.
+
+        Mirrors the live bot's ``compute_lot_size`` logic:
+          allocation = (risk_pct / 100) / (SL_distance / close)
+
+        where SL_distance = ATR * ATR_SL_MULTIPLIER.  The result is a
+        leverage-like multiplier applied to the position's return.
+        """
+        cfg = self.cfg
+        sym_type = self.symbol_types.get(symbol, "Forex")
+        risk_pct = cfg.risk_per_type.get(sym_type, cfg.risk_per_trade_pct)
+
+        df = self.all_forecasts.get(symbol)
+        if df is None or date not in df.index:
+            return risk_pct / 100.0
+
+        atr = df.loc[date, "_ATR"] if "_ATR" in df.columns else 0.0
+        if not np.isfinite(atr) or atr <= 0 or close <= 0:
+            return risk_pct / 100.0
+
+        sl_distance_pct = (atr * cfg.atr_sl_multiplier) / close
+        if sl_distance_pct <= 0:
+            return risk_pct / 100.0
+
+        alloc = (risk_pct / 100.0) / sl_distance_pct
+        return min(alloc, cfg.max_alloc_per_trade)
 
     # ------------------------------------------------------------------
     # Strategy simulation
@@ -208,26 +289,48 @@ class Backtester:
                     continue
 
                 exit_idx = min(i + best["Days"], len(self.common_dates) - 1)
-                alloc = 1.0 / cfg.max_concurrent
+
+                # Risk-based allocation mirroring live bot's position sizing
+                sym_df = self.all_forecasts.get(best["Symbol"])
+                close_at_entry = float(sym_df.loc[date, "Close"]) if (
+                    sym_df is not None and date in sym_df.index
+                    and "Close" in sym_df.columns
+                ) else 0.0
+                alloc = self._compute_trade_allocation(
+                    best["Symbol"], date, close_at_entry,
+                )
+
+                # Enforce global risk cap
+                active_risk = sum(
+                    p.get("risk_pct_used", 0.0) for p in active_positions
+                )
+                sym_type = self.symbol_types.get(best["Symbol"], "Forex")
+                trade_risk_pct = cfg.risk_per_type.get(
+                    sym_type, cfg.risk_per_trade_pct,
+                )
+                if active_risk + trade_risk_pct > cfg.global_max_risk_pct:
+                    continue
 
                 position = {
                     **best,
-                    "entry_idx":  i,
-                    "exit_idx":   exit_idx,
-                    "BuyDate":    date,
-                    "Allocation": alloc,
+                    "entry_idx":     i,
+                    "exit_idx":      exit_idx,
+                    "BuyDate":       date,
+                    "Allocation":    alloc,
+                    "risk_pct_used": trade_risk_pct,
                 }
                 active_positions.append(position)
                 open_symbols.add(best["Symbol"])
                 filled += 1
 
                 entry_point = {
-                    "Date":      date,
-                    "Value":     strategy_value,
-                    "Symbol":    best["Symbol"],
-                    "Horizon":   best["Period"],
-                    "Pred_Prob": best["Pred_Prob"],
-                    "Adj_Prob":  best["Adj_Prob"],
+                    "Date":       date,
+                    "Value":      strategy_value,
+                    "Symbol":     best["Symbol"],
+                    "Horizon":    best["Period"],
+                    "Pred_Prob":  best["Pred_Prob"],
+                    "Adj_Prob":   best["Adj_Prob"],
+                    "Allocation": alloc,
                 }
                 if best["Side"] == "BUY":
                     self.buy_points.append(entry_point)
@@ -296,10 +399,16 @@ class Backtester:
         strategy_entries: Dict[int, list] = {}
         for bp in self.buy_points:
             idx = date_to_idx[bp["Date"]]
-            strategy_entries.setdefault(idx, []).append({"horizon": bp["Horizon"], "side": "BUY"})
+            strategy_entries.setdefault(idx, []).append({
+                "horizon": bp["Horizon"], "side": "BUY",
+                "alloc": bp.get("Allocation", 1.0 / cfg.max_concurrent),
+            })
         for sp in self.sell_points:
             idx = date_to_idx[sp["Date"]]
-            strategy_entries.setdefault(idx, []).append({"horizon": sp["Horizon"], "side": "SELL"})
+            strategy_entries.setdefault(idx, []).append({
+                "horizon": sp["Horizon"], "side": "SELL",
+                "alloc": sp.get("Allocation", 1.0 / cfg.max_concurrent),
+            })
 
         slippage_mult = 1.0 - (cfg.slippage_bps / 10000.0)
         self.random_results = np.zeros((len(self.common_dates), cfg.random_runs))
@@ -332,7 +441,7 @@ class Backtester:
                         rand_positions.append({
                             "exit_idx": exit_idx,
                             "ret": effective_return,
-                            "alloc": 1.0 / cfg.max_concurrent,
+                            "alloc": entry_info.get("alloc", 1.0 / cfg.max_concurrent),
                         })
                 self.random_results[i, run] = value
 
@@ -360,12 +469,14 @@ class Backtester:
     def compute_metrics(self) -> Dict[str, float]:
         """Compute all performance metrics and store in self.metrics."""
         arr = np.array(self.strategy_history)
-        strat_final = arr[-1] if len(arr) else 1.0
-        rand_final = self.random_mean[-1] if self.random_mean is not None else 1.0
+        strat_final = arr[-1] if len(arr) else self.cfg.initial_value
+        rand_final = self.random_mean[-1] if self.random_mean is not None else self.cfg.initial_value
 
         n_years = len(self.common_dates) / 252
-        strat_ann = (strat_final ** (1 / n_years) - 1) * 100 if n_years > 0 else 0
-        rand_ann = (rand_final ** (1 / n_years) - 1) * 100 if n_years > 0 else 0
+        strat_growth = strat_final / self.cfg.initial_value
+        rand_growth = rand_final / self.cfg.initial_value
+        strat_ann = (strat_growth ** (1 / n_years) - 1) * 100 if n_years > 0 else 0
+        rand_ann = (rand_growth ** (1 / n_years) - 1) * 100 if n_years > 0 else 0
 
         strat_peak = np.maximum.accumulate(arr)
         strat_dd = (arr - strat_peak) / strat_peak
@@ -424,13 +535,20 @@ class Backtester:
     def print_summary(self):
         m = self.metrics
         cfg = self.cfg
+        strat_pct = (m['strat_final'] / cfg.initial_value - 1) * 100
+        rand_pct = (m['rand_final'] / cfg.initial_value - 1) * 100
         print(f"\n{'='*60}")
         print(f" BACKTEST PERFORMANCE SUMMARY")
         print(f"{'='*60}")
+        print(f" Starting Equity:          R {cfg.initial_value:,.2f}")
+        print(f" Position Sizing:          ATR-based (risk-% of equity)")
         print(f" Max Concurrent Positions: {cfg.max_concurrent}")
         print(f" Slippage (round-trip):    {cfg.slippage_bps} bps")
-        print(f" Strategy Final Value:    {m['strat_final']:.4f}  ({(m['strat_final']-1)*100:+.1f}%)")
-        print(f" Random Mean Final Value: {m['rand_final']:.4f}  ({(m['rand_final']-1)*100:+.1f}%)")
+        print(f" Risk per Trade:           {cfg.risk_per_trade_pct}% (per-type: {dict(cfg.risk_per_type)})")
+        print(f" ATR SL Multiplier:        {cfg.atr_sl_multiplier}x")
+        print(f" Global Risk Cap:          {cfg.global_max_risk_pct}%")
+        print(f" Strategy Final Value:    R {m['strat_final']:,.2f}  ({strat_pct:+.1f}%)")
+        print(f" Random Mean Final Value: R {m['rand_final']:,.2f}  ({rand_pct:+.1f}%)")
         print(f" Strategy Annualized:     {m['strat_ann']:+.2f}%")
         print(f" Random Mean Annualized:  {m['rand_ann']:+.2f}%")
         print(f" Max Drawdown:            {m['max_dd']:.1f}%")
@@ -508,10 +626,10 @@ class Backtester:
         ax.set_xlim(dates[0], dates[-1])
         ax.set_title("AI Strategy vs Random Baseline (Fair Comparison)", color="white", fontsize=22)
         ax.set_xlabel("Date", color="white")
-        ax.set_ylabel("Portfolio Value (log scale)", color="white")
+        ax.set_ylabel("Portfolio Value \u2013 ZAR (log scale)", color="white")
         ax.tick_params(colors="white")
-        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.2f}'))
-        ax.axhline(y=1.0, color="gray", lw=1, ls="--", alpha=0.4)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'R {y:,.0f}'))
+        ax.axhline(y=self.cfg.initial_value, color="gray", lw=1, ls="--", alpha=0.4)
 
         legend = ax.legend(facecolor="black", edgecolor="white", fontsize=12, loc="upper left")
         for text in legend.get_texts():
