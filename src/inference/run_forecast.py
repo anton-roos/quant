@@ -298,7 +298,17 @@ def cache_preprocessed(csv_path: Path, train_cutoff, train_val_cutoff, ctx: Pipe
 
 class InstrumentDataGenerator(tf.keras.utils.Sequence):
     """Generates batches of instrument data for training"""
-    def __init__(self, csv_paths, batch_size=512, split="train", shuffle=True, use_time_weights=True, decay_factor=0.001):
+    def __init__(
+        self,
+        csv_paths,
+        batch_size=512,
+        split="train",
+        shuffle=True,
+        use_time_weights=True,
+        decay_factor=0.001,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
         self.csv_paths = csv_paths
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -336,7 +346,8 @@ class InstrumentDataGenerator(tf.keras.utils.Sequence):
 
     def __getitem__(self, idx):
         batch_indices = self.indices[idx * self.batch_size:(idx + 1) * self.batch_size]
-        X_batch, y_batch, weights_batch = [], [], []
+        X_batch, y_batch = [], []
+        weights_batch = [] if self.use_time_weights else None
         cache = {}
         for bi in batch_indices:
             symbol_name, win_idx = self.windows[bi]
@@ -348,18 +359,21 @@ class InstrumentDataGenerator(tf.keras.utils.Sequence):
             X_batch.append(X_arr[win_idx])
             y_batch.append(y_arr[win_idx])
 
-            if self.use_time_weights and symbol_name in self.date_arrays:
-                dates = self.date_arrays[symbol_name]
-                date = pd.to_datetime(dates[win_idx])
-                # Give more weight to recent dates
-                date_ago = (pd.Timestamp.now() - date).days
-                weights_batch.append(np.exp(-self.decay_factor * date_ago))
-            else:
-                weights_batch.append(1.0)
+            if self.use_time_weights:
+                if symbol_name in self.date_arrays:
+                    dates = self.date_arrays[symbol_name]
+                    date = pd.to_datetime(dates[win_idx])
+                    # Give more weight to recent dates
+                    date_ago = (pd.Timestamp.now() - date).days
+                    weights_batch.append(np.exp(-self.decay_factor * date_ago))
+                else:
+                    weights_batch.append(1.0)
 
-        return (np.array(X_batch, dtype=np.float32), 
-                np.array(y_batch, dtype=np.float32),
-                np.array(weights_batch, dtype=np.float32))
+        X_out = np.array(X_batch, dtype=np.float32)
+        y_out = np.array(y_batch, dtype=np.float32)
+        if self.use_time_weights:
+            return (X_out, y_out, np.array(weights_batch, dtype=np.float32))
+        return (X_out, y_out)
 
     def on_epoch_end(self):
         if self.shuffle:
@@ -535,7 +549,7 @@ def main():
     logger.info("Step 3: Creating data generators...")
     
     train_gen = InstrumentDataGenerator(all_csvs, batch_size=128, split="train", shuffle=True, use_time_weights=False, decay_factor=0.002)
-    val_gen = InstrumentDataGenerator(all_csvs, batch_size=128, split="val", shuffle=False)
+    val_gen = InstrumentDataGenerator(all_csvs, batch_size=128, split="val", shuffle=False, use_time_weights=False)
     
     logger.info(f"Train generator length: {len(train_gen)}")
     logger.info(f"Val generator length: {len(val_gen)}")

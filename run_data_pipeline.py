@@ -42,6 +42,23 @@ def run_training():
     print("\n" + "=" * 60)
     print(" STEP 1: Training model + generating forecasts")
     print("=" * 60)
+
+    # Fail fast with a helpful message if user runs the wrong interpreter.
+    try:
+        import tensorflow as _tf  # noqa: F401
+    except ModuleNotFoundError as e:
+        if e.name != "tensorflow":
+            raise
+        project_root = Path(__file__).parent
+        venv_python = project_root / ".venv" / "Scripts" / "python.exe"
+        hint = (
+            f"TensorFlow is not available in this Python interpreter: {sys.executable}\n"
+            f"Activate the project's virtual environment or run using:\n  {venv_python} run_data_pipeline.py\n"
+        )
+        if not venv_python.exists():
+            hint += "(Couldn't find .venv at project root.)\n"
+        raise SystemExit(hint) from None
+
     from src.inference.run_forecast import main as forecast_main
     forecast_main()
 
