@@ -40,8 +40,8 @@ class TrainingConfig:
     MIN_VAL_AUC: float = 0.55
     BATCH_SIZE: int = 128
     MAX_EPOCHS: int = 500
-    EARLY_STOP_PATIENCE: int = 30
-    REDUCE_LR_PATIENCE: int = 10
+    EARLY_STOP_PATIENCE: int = 15
+    REDUCE_LR_PATIENCE: int = 5
 
     def resolve_paths(self, root: Optional[Path] = None) -> Dict[str, Path]:
         """Return resolved Path objects relative to *root* (default: PROJECT_ROOT)."""

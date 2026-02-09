@@ -7,7 +7,8 @@ models.
 """
 
 from keras.models import Sequential
-from keras.layers import Conv1D, LSTM, Dense, BatchNormalization
+from keras.layers import Conv1D, Input, LSTM, Dense, BatchNormalization, GaussianNoise
+from keras.regularizers import l2
 
 from src.models.layers import MCDropout
 
@@ -30,31 +31,39 @@ def build_model(n_features: int, window_size: int, n_outputs: int = 8) -> Sequen
     Sequential
         An **uncompiled** Keras model.
     """
+    _l2 = l2(1e-4)
+
     model = Sequential([
+        # Explicit input shape
+        Input(shape=(window_size + 1, n_features)),
+        # Input noise for regularisation (active during training only)
+        GaussianNoise(0.01),
+
         # Temporal convolution to capture local patterns
         Conv1D(
             64, kernel_size=3, activation="relu", padding="same",
-            input_shape=(window_size + 1, n_features),
+            kernel_regularizer=_l2,
         ),
         BatchNormalization(),
-        MCDropout(0.3),
+        MCDropout(0.4),
 
         # Second conv layer for higher-level patterns
-        Conv1D(32, kernel_size=3, activation="relu", padding="same"),
+        Conv1D(32, kernel_size=3, activation="relu", padding="same",
+               kernel_regularizer=_l2),
         BatchNormalization(),
-        MCDropout(0.2),
+        MCDropout(0.3),
 
         # Stacked LSTMs for long-range dependencies
-        LSTM(128, return_sequences=True),
-        MCDropout(0.3),
-        LSTM(64, return_sequences=False),
-        MCDropout(0.3),
+        LSTM(128, return_sequences=True, kernel_regularizer=_l2),
+        MCDropout(0.4),
+        LSTM(64, return_sequences=False, kernel_regularizer=_l2),
+        MCDropout(0.4),
 
         # Dense head
-        Dense(64, activation="relu"),
+        Dense(64, activation="relu", kernel_regularizer=_l2),
         BatchNormalization(),
-        MCDropout(0.2),
-        Dense(32, activation="relu"),
+        MCDropout(0.3),
+        Dense(32, activation="relu", kernel_regularizer=_l2),
         Dense(n_outputs, activation="sigmoid"),
     ])
     return model

@@ -573,7 +573,7 @@ def main():
         monitor="val_loss",
         factor=0.5,
         patience=CONFIG["REDUCE_LR_PATIENCE"],
-        min_lr=1e-6,
+        min_lr=1e-5,
         verbose=1,
     )
 
@@ -609,9 +609,18 @@ def main():
     logger.info("Step 4b: Checking model quality before deployment...")
     
     MIN_VAL_AUC = CONFIG["MIN_VAL_AUC"]
-    final_val_auc = history.history.get("val_auc", [0])[-1]
-    final_val_loss = history.history.get("val_loss", [float('inf')])[-1]
-    logger.info(f"Final val AUC: {final_val_auc:.4f}, val loss: {final_val_loss:.4f}")
+
+    # Use the best-epoch metrics (matching restore_best_weights=True),
+    # not the last epoch which may be worse.
+    val_auc_hist = history.history.get("val_auc", [0])
+    val_loss_hist = history.history.get("val_loss", [float('inf')])
+    best_epoch = int(np.argmin(val_loss_hist))  # EarlyStopping monitors val_loss
+    final_val_auc = val_auc_hist[best_epoch]
+    final_val_loss = val_loss_hist[best_epoch]
+    logger.info(
+        f"Best val_loss at epoch {best_epoch + 1}: "
+        f"val AUC: {final_val_auc:.4f}, val loss: {final_val_loss:.4f}"
+    )
     
     if final_val_auc < MIN_VAL_AUC:
         logger.error(
