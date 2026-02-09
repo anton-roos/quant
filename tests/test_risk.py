@@ -1,8 +1,17 @@
 """
 Tests for risk management checks.
 """
+import types
+
 import pytest
 from unittest.mock import Mock, patch
+
+import src.risk as _risk_mod
+
+# When MetaTrader5 is not installed, src.risk.mt5 is None.
+# Replace it with a stub module so @patch('src.risk.mt5.symbol_info') works.
+if _risk_mod.mt5 is None:
+    _risk_mod.mt5 = types.ModuleType('MetaTrader5')
 
 from src.risk import RiskManager, KillSwitch
 from src.models import OrderSide, ErrorCode
@@ -58,7 +67,7 @@ def test_risk_manager_no_stop_loss():
     assert "Stop loss is required" in result.error_message
 
 
-@patch('src.risk.mt5.symbol_info')
+@patch('src.risk.mt5.symbol_info', create=True)
 def test_risk_manager_trade_risk_calculation(mock_symbol_info):
     """Test trade risk calculation."""
     # Mock symbol info
@@ -124,7 +133,7 @@ def test_validate_order_full_checks():
     )
     
     # Mock MT5 symbol info
-    with patch('src.risk.mt5.symbol_info') as mock_symbol_info:
+    with patch('src.risk.mt5.symbol_info', create=True) as mock_symbol_info:
         mock_info = Mock()
         mock_info.point = 0.00001
         mock_info.trade_tick_value = 1.0

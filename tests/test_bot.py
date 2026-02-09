@@ -9,13 +9,17 @@ import os
 import sys
 import tempfile
 import types
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch, PropertyMock
 
 import numpy as np
 import pandas as pd
 import pytest
+
+# bot.py imports tensorflow at module level; skip all bot tests when TF
+# is not installed so the rest of the test suite still runs cleanly.
+tf = pytest.importorskip("tensorflow", reason="tensorflow not installed")
 
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -122,6 +126,10 @@ def _build_bot(tmp_workspace, config_overrides=None):
     bot.peak_equity = 10000.0
     bot.last_refresh_date = None
     bot._cycle_cache = {}
+
+    # Slot manager (per-instrument-type allocation)
+    from src.trading.slot_manager import SlotManager
+    bot.slot_manager = SlotManager.from_config(config)
 
     # Mock model (returns 8 outputs: 4 up + 4 down)
     mock_model = MagicMock()
@@ -391,9 +399,9 @@ class TestWeekendClose:
         ]
 
         # Mock datetime to be Friday 21:00 UTC
-        friday = datetime(2026, 2, 6, 21, 0)  # Feb 6, 2026 is a Friday
+        friday = datetime(2026, 2, 6, 21, 0, tzinfo=timezone.utc)  # Feb 6, 2026 is a Friday
         with patch("src.trading.bot.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = friday
+            mock_dt.now.return_value = friday
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             bot.execute_cycle()
 

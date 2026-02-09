@@ -1,6 +1,6 @@
 # AI Market Predictor
 
-A deep learning pipeline that forecasts short-term market movements in **Forex, Indices, Commodities, and Crypto** using technical indicators, Monte Carlo dropout uncertainty estimation, and walk-forward validation.
+A deep learning pipeline that forecasts short-term market movements in **Forex, Indices, Commodities, and Crypto** using technical indicators, Monte Carlo dropout uncertainty estimation, walk-forward validation, and an autonomous live-trading bot.
 
 ---
 
@@ -15,20 +15,22 @@ A deep learning pipeline that forecasts short-term market movements in **Forex, 
 7. [Step 3 — Process Data (Compute Indicators)](#step-3--process-data-compute-indicators)
 8. [Step 4 — Train Model & Generate Forecasts](#step-4--train-model--generate-forecasts)
 9. [Step 5 — Run Backtests](#step-5--run-backtests)
-10. [Project Structure](#project-structure)
-11. [Configuration Reference](#configuration-reference)
-12. [Customizing Symbols](#customizing-symbols)
-13. [Technical Indicators](#technical-indicators)
-14. [Troubleshooting](#troubleshooting)
+10. [Step 6 — Run the Live Trading Bot](#step-6--run-the-live-trading-bot)
+11. [Walk-Forward Retraining](#walk-forward-retraining)
+12. [Project Structure](#project-structure)
+13. [Configuration Reference](#configuration-reference)
+14. [Customizing Symbols](#customizing-symbols)
+15. [Technical Indicators](#technical-indicators)
+16. [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Overview
 
-The pipeline follows four stages executed in order:
+The pipeline follows six stages:
 
 ```
-Download (MT5 Bridge) → Process (indicators) → Forecast (LSTM) → Backtest (walk-forward)
+Download (MT5 Bridge) → Process (indicators) → Forecast (LSTM) → Backtest → Live Bot → Retrain
 ```
 
 | Feature | Description |
@@ -39,7 +41,11 @@ Download (MT5 Bridge) → Process (indicators) → Forecast (LSTM) → Backtest 
 | **Multi-Asset Support** | 65 instruments across Forex, Indices, Commodities, Crypto |
 | **MT5 Bridge** | REST API bridge to MetaTrader 5 (FastAPI / uvicorn) |
 | **Efficient Data Generator** | Loads multiple instruments from NumPy cache in batches |
-| **Confidence Threshold** | Only trades when model confidence > 0.7 (configurable) |
+| **Confidence Threshold** | Only trades when model confidence exceeds threshold (configurable) |
+| **Autonomous Trading Bot** | Live execution with slot management, risk filters, trailing stops, and notifications |
+| **Walk-Forward Retraining** | Periodic model retraining with champion/challenger validation |
+| **Risk Management** | Per-type slot limits, drawdown circuit breaker, correlation filter, spread gate |
+| **Trade Journal** | SQLite-backed journal with cumulative P&L and Sharpe tracking |
 
 ---
 
@@ -103,18 +109,14 @@ The bridge has its own requirements (FastAPI, uvicorn, MetaTrader5 package, etc.
 pip install -r src/mt5_bridge/requirements.txt
 ```
 
-### 5. Create your config file
+### 5. Verify your bot config
 
-```powershell
-Copy-Item config/config.example.json config/config.json
-```
-
-The default config points to the bridge at `127.0.0.1:8787` — no changes needed unless you run the bridge on a different host/port.
+The bot reads `config/bot_config.json` at startup — the default points to the bridge at `127.0.0.1:8787`. No changes needed unless you run the bridge on a different host/port.
 
 ```json
 {
-    "MT5_BRIDGE_HOST": "127.0.0.1",
-    "MT5_BRIDGE_PORT": 8787
+    "MT5_HOST": "127.0.0.1",
+    "MT5_PORT": 8787
 }
 ```
 
@@ -260,12 +262,81 @@ This reads the forecast CSVs and simulates a probability-based trading strategy:
 
 ---
 
+## Step 6 — Run the Live Trading Bot
+
+> **Prerequisites:** Complete Steps 1–4 first. The MT5 Bridge must be running, and trained model artefacts must exist in `outputs/models/`.
+
+```powershell
+python run_bot.py
+```
+
+**What it does (runs continuously):**
+
+1. Loads the trained LSTM model, scaler, and feature columns from `outputs/models/`
+2. Every 5 minutes (configurable via `CHECK_INTERVAL_SECONDS`) scans all 65 instruments
+3. Downloads the latest candle, recomputes indicators, runs MC Dropout inference
+4. Ranks candidates by multi-horizon weighted probability (`1d`, `1w`, `1m`, `6m`)
+5. Applies risk filters (drawdown breaker, correlation, spread/ATR gate, volatility regime)
+6. Opens positions via the MT5 Bridge with ATR-based stop-loss and take-profit
+7. Manages open positions: trailing stops, breakeven moves, weekend close
+8. Logs every action to `outputs/bot_logs/` and records trades in an SQLite journal
+
+**Key features:**
+
+| Feature | Description |
+|---------|-------------|
+| **Slot Manager** | Per-instrument-type limits (e.g. max 3 Forex, 1 Crypto) with a global cap of 5 |
+| **Risk Filters** | Drawdown circuit breaker, correlation filter, spread gate, volatility regime filter |
+| **Position Sizing** | ATR-based SL/TP, profit-currency conversion, configurable lot limits |
+| **Trailing Stops** | Auto-breakeven after 1×R, then trail at 1.5× ATR |
+| **Weekend Protection** | Closes all positions before Friday 20:00 UTC (configurable) |
+| **Trade Journal** | SQLite-backed log with P&L, Sharpe, and win-rate tracking |
+| **Notifications** | Webhook alerts (Discord/Slack/Telegram) for trades, drawdowns, and errors |
+| **Config Validation** | Validates all 40+ config keys at startup before risking money |
+| **Kill Switch** | Emergency halt via `kill_switch.state` file |
+
+Stop the bot with `Ctrl+C` — it handles `SIGINT`/`SIGTERM` gracefully.
+
+---
+
+## Walk-Forward Retraining
+
+The bot can automatically retrain the model on a configurable schedule (default: every 30 days).
+
+```powershell
+# Standalone (e.g. monthly cron):
+python -m src.inference.walk_forward_retrain
+```
+
+**How it works:**
+
+1. Loads all processed CSVs with an expanding training window
+2. Trains a new model candidate
+3. Evaluates on out-of-sample validation data (requires AUC > `MIN_VAL_AUC`)
+4. Deploys the new model **only** if it beats the current one
+5. Saves retrain state to `outputs/models/retrain_state.json`
+
+When `RETRAIN_ENABLED` is `true` in `config/bot_config.json`, the bot calls this automatically via `TradingBot.maybe_retrain()`.
+
+---
+
 ## Project Structure
 
 ```
 LSTM_AI_Stock_Predictor/
 │
-├── src/                              # All source code
+├── run_bot.py                        # Entry point for the live trading bot
+├── requirements.txt                  # Python dependencies (main)
+├── README.md                         # ← you are here
+│
+├── config/
+│   ├── bot_config.json               # All runtime config (bridge, risk, slots, etc.)
+│   └── symbols.json                  # 65 trading instruments
+│
+├── src/
+│   ├── config.py                     # Unified TrainingConfig + BotConfig dataclasses
+│   ├── risk.py                       # RiskManager + KillSwitch for pre-trade validation
+│   │
 │   ├── data/                         # Data pipeline
 │   │   ├── downloader.py             # Orchestrates MT5 download
 │   │   ├── processor.py              # Computes 33 technical indicators
@@ -274,12 +345,28 @@ LSTM_AI_Stock_Predictor/
 │   │   ├── indicators_data/
 │   │   │   ├── raw/                  # Raw OHLCV (forex/, indices/, ...)
 │   │   │   └── processed/           # Processed features
-│   │   ├── symbols.csv              # Flat symbol list
 │   │   └── indicators_list.txt      # Feature documentation
+│   │
+│   ├── models/                       # Model definitions
+│   │   ├── lstm.py                   # build_model() — Conv1D + LSTM factory
+│   │   ├── layers.py                 # MCDropout & Attention custom layers
+│   │   └── context.py                # PipelineContext (scaler, features, thresholds)
 │   │
 │   ├── inference/                    # ML pipeline
 │   │   ├── run_forecast.py           # Train + predict (Conv1D + LSTM + MC Dropout)
-│   │   └── run_backtest.py           # Walk-forward backtesting
+│   │   ├── run_backtest.py           # Walk-forward backtesting
+│   │   └── walk_forward_retrain.py   # Periodic model retraining
+│   │
+│   ├── trading/                      # Live trading bot
+│   │   ├── bot.py                    # Main TradingBot loop (1 371 lines)
+│   │   ├── signal_generator.py       # Model inference & candidate ranking
+│   │   ├── position_sizer.py         # ATR-based SL/TP & lot sizing
+│   │   ├── risk_filters.py           # Drawdown, correlation, spread, volatility gates
+│   │   ├── slot_manager.py           # Per-type slot allocation with global cap
+│   │   ├── trade_journal.py          # SQLite trade journal (P&L, Sharpe, etc.)
+│   │   ├── notifications.py          # Webhook notifier (Discord/Slack/Telegram)
+│   │   ├── mt5_client.py             # MT5 Bridge REST client with retries
+│   │   └── config_validator.py       # Startup config validation
 │   │
 │   ├── mt5_bridge/                   # FastAPI bridge to MetaTrader 5
 │   │   ├── src/
@@ -294,41 +381,29 @@ LSTM_AI_Stock_Predictor/
 │   │   ├── README.md                # Bridge docs
 │   │   └── API_REFERENCE.md         # Full API reference
 │   │
-│   ├── models/                       # (reserved for model definitions)
 │   └── utils/                        # Shared utilities
-│
-├── config/
-│   ├── config.json                   # Runtime config (host, port)
-│   ├── config.example.json           # Template (committed to git)
-│   └── symbols.json                  # 65 trading instruments
+│       └── constants.py              # HORIZONS, folder mappings, sanitize helpers
 │
 ├── outputs/                          # All generated outputs
 │   ├── forecasts/                    # Forecast CSVs (one per instrument)
 │   ├── cache/                        # Preprocessed NumPy cache
-│   ├── models/                       # Saved Keras model checkpoints
+│   ├── models/                       # Saved model, scaler, feature_cols, retrain state
+│   ├── bot_logs/                     # Timestamped bot log files
 │   └── videos/                       # Backtest plots & videos
 │
 ├── tests/                            # Test suite
-├── notebooks/                        # Jupyter notebooks
-├── experiments/                      # Experimental code
-├── docs/                             # Extra documentation
+│   ├── test_bot.py                   # Trading bot tests
+│   ├── test_models.py                # Model architecture tests
+│   ├── test_pipeline.py              # Data pipeline tests
+│   ├── test_risk.py                  # Risk manager / kill switch tests
+│   └── test_slot_manager.py          # Slot allocation tests
 │
-├── requirements.txt                  # Python dependencies (main)
-├── PROJECT_STRUCTURE.md              # Detailed structure docs
-├── .gitignore
-└── README.md                         # ← you are here
+└── .gitignore
 ```
 
 ---
 
 ## Configuration Reference
-
-### `config/config.json`
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `MT5_BRIDGE_HOST` | `127.0.0.1` | Host where MT5 Bridge is running |
-| `MT5_BRIDGE_PORT` | `8787` | Port for MT5 Bridge |
 
 ### `src/mt5_bridge/.env`
 
@@ -342,14 +417,52 @@ LSTM_AI_Stock_Predictor/
 | `MT5_SERVER` | *(empty)* | MT5 broker server (optional) |
 | `ALLOW_LIVE_TRADING` | `false` | Enable live trade execution |
 
-### Forecast pipeline settings (in `run_forecast.py`)
+### Forecast pipeline settings (`src/config.py` → `TrainingConfig`)
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `WINDOW_SIZE` | 90 | Number of trading days per input window |
-| `MC_DROPOUT_SAMPLES` | 25 | Monte Carlo forward passes for uncertainty |
+| `MC_DROPOUT_SAMPLES` | 50 | Monte Carlo forward passes for uncertainty |
 | `PROB_THRESHOLD` | 0.7 | Minimum probability to signal a buy |
 | `TRAIN_VAL_FRAC` | 0.8 | Fraction of data used for train+val |
+| `BATCH_SIZE` | 128 | Training batch size |
+| `MAX_EPOCHS` | 500 | Maximum training epochs |
+| `EARLY_STOP_PATIENCE` | 30 | Early stopping patience (epochs) |
+| `MIN_VAL_AUC` | 0.55 | Minimum validation AUC to accept a retrained model |
+
+### Bot settings (`config/bot_config.json`)
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `MT5_HOST` | `127.0.0.1` | MT5 Bridge address |
+| `MT5_PORT` | `8787` | MT5 Bridge port |
+| `MAGIC` | `24001` | EA magic number for order identification |
+| `MIN_ACCEPTED` | `0.50` | Minimum adjusted probability to open a trade |
+| `STD_FACTOR` | `1.0` | Uncertainty penalty: `adj_prob = raw_prob − STD_FACTOR × std` |
+| `MAX_CONCURRENT_POSITIONS` | `3` | Legacy max open positions (see slot manager) |
+| `RISK_PER_TRADE_PCT` | `1.0` | Default risk per trade as % of equity |
+| `GLOBAL_MAX_SLOTS` | `5` | Maximum simultaneous open positions across all types |
+| `GLOBAL_MAX_RISK_PCT` | `5.0` | Maximum total portfolio risk (%) |
+| `DEFAULT_LOT_SIZE` | `0.01` | Minimum lot size when position sizer can't calculate |
+| `MAX_LOT_SIZE` | `1.0` | Maximum lot size cap |
+| `ATR_SL_MULTIPLIER` | `2.0` | Stop-loss distance = ATR × this value |
+| `ATR_TP_MULTIPLIER` | `3.0` | Take-profit distance = ATR × this value |
+| `MAX_DRAWDOWN_PCT` | `15.0` | Drawdown circuit breaker threshold (%) |
+| `CORRELATION_THRESHOLD` | `0.7` | Skip new trade if correlated > this with existing position |
+| `CORRELATION_LOOKBACK` | `60` | Days of return history for correlation check |
+| `TRAILING_STOP_ENABLED` | `true` | Enable trailing stop management |
+| `BREAKEVEN_AFTER_R` | `1.0` | Move SL to breakeven after N×R profit |
+| `TRAILING_ATR_MULTIPLIER` | `1.5` | Trail distance = ATR × this value |
+| `MAX_SPREAD_ATR_RATIO` | `0.15` | Reject trade if spread/ATR > this |
+| `CLOSE_BEFORE_WEEKEND` | `true` | Close all positions before weekend |
+| `FRIDAY_CLOSE_HOUR_UTC` | `20` | Hour (UTC) to close positions on Friday |
+| `VOLATILITY_FILTER_ENABLED` | `true` | Enable ATR-percentile volatility regime filter |
+| `HORIZON_WEIGHTS` | `{"1d":1.5, "1w":1.2, "1m":1.0, "6m":0.6}` | Multi-horizon weighting for signal ranking |
+| `RETRAIN_ENABLED` | `true` | Enable automatic walk-forward retraining |
+| `RETRAIN_INTERVAL_DAYS` | `30` | Days between retrain attempts |
+| `CHECK_INTERVAL_SECONDS` | `300` | Seconds between bot scan cycles |
+| `NOTIFY_WEBHOOK_URL` | *(empty)* | Webhook URL for trade/error notifications |
+| `STATE_FILE` | `outputs/bot_state.json` | Bot state persistence file |
 
 ---
 
@@ -400,7 +513,7 @@ All 33 features are computed automatically in `src/data/processor.py`:
 |---------|-----|
 | `ModuleNotFoundError: MetaTrader5` | `pip install MetaTrader5` — only works on Windows |
 | `MT5 initialization failed` | Make sure MetaTrader 5 is open and logged in |
-| Port already in use | Change `BRIDGE_PORT` in `.env` and `config.json` |
+| Port already in use | Change `BRIDGE_PORT` in `.env` and `MT5_PORT` in `bot_config.json` |
 
 ### Downloader fails
 
@@ -418,6 +531,16 @@ All 33 features are computed automatically in `src/data/processor.py`:
 | Out-of-memory | Reduce `batch_size` in `run_forecast.py` (default 128) |
 | Very slow training | Install GPU-enabled TensorFlow: `pip install tensorflow[and-cuda]` |
 
+### Trading bot issues
+
+| Symptom | Fix |
+|---------|-----|
+| `Config validation failed` | Check `config/bot_config.json` values — the validator prints which keys are invalid |
+| Bot halts immediately | Check `kill_switch.state` — if `{"active": true}`, delete the file or set to `false` |
+| `Model file not found` | Run Steps 2–4 first to generate `outputs/models/lstm_model.keras` |
+| No trades opening | Lower `MIN_ACCEPTED` (default 0.50) or check that the bridge has market prices |
+| Drawdown halt | Bot stops when equity drops > `MAX_DRAWDOWN_PCT` from peak — restart after reviewing |
+
 ### General
 
 ```powershell
@@ -433,4 +556,7 @@ Get-ChildItem src/data/indicators_data/raw/forex/*.csv | Measure-Object
 
 # Check if processed data exists
 Get-ChildItem src/data/indicators_data/processed/forex/*.csv | Measure-Object
+
+# Check bot logs
+Get-ChildItem outputs/bot_logs/*.log | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content -Tail 50
 ```

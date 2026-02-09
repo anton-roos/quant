@@ -10,7 +10,6 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 
 from src.utils.constants import CATEGORY_TYPE_TO_FOLDER, sanitize_filename

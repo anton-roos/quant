@@ -2,8 +2,7 @@
 Technical indicator calculations using numpy and pandas.
 """
 import numpy as np
-import pandas as pd
-from typing import List, Dict, Tuple
+from typing import List, Tuple
 
 
 def calculate_rsi(prices: List[float], period: int = 14) -> List[float]:

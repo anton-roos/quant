@@ -506,14 +506,6 @@
       "currency_profit": "TRY"
     },
     {
-      "name": "USDZAR",
-      "description": "USD/ZAR Indicator Only",
-      "type": "Forex",
-      "path": "CFDs\\Indicator Only\\USDZAR",
-      "currency_base": "USD",
-      "currency_profit": "ZAR"
-    },
-    {
       "name": "Wall Street 30",
       "description": "Wall Street 30",
       "type": "Index",

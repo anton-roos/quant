@@ -35,9 +35,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import tensorflow as tf
-from tensorflow.keras.models import load_model
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.metrics import AUC
+from keras.models import load_model
+from keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from keras.metrics import AUC
 from sklearn.preprocessing import StandardScaler
 
 from src.models.layers import MCDropout

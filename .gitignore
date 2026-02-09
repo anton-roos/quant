@@ -15,8 +15,7 @@ outputs/models/
 outputs/cache/
 outputs/bot_logs/
 
-# Config with secrets
-config/config.json
+
 
 # MT5 Bridge logs
 src/mt5_bridge/logs/

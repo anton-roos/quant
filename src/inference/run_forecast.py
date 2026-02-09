@@ -31,8 +31,8 @@ import tensorflow as tf
 tf.random.set_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.metrics import AUC
+from keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from keras.metrics import AUC
 from sklearn.preprocessing import StandardScaler
 import glob
 import shutil

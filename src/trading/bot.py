@@ -16,7 +16,7 @@ import time
 import logging
 import signal
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -36,7 +36,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # Suppress TF info logs
 
 import tensorflow as tf
-from tensorflow.keras.models import load_model
+from keras.models import load_model
 
 from src.models.layers import MCDropout
 from src.utils.constants import sanitize_filename, CATEGORY_TYPE_TO_FOLDER
@@ -324,7 +324,7 @@ class TradingBot:
                 "start_equity": self.start_equity,
                 "peak_equity": self.peak_equity,
                 "last_refresh_date": self.last_refresh_date,
-                "saved_at": datetime.utcnow().isoformat(),
+                "saved_at": datetime.now(timezone.utc).isoformat(),
             }
             with open(state_path, "w") as f:
                 json.dump(state, f, indent=2)
@@ -400,7 +400,7 @@ class TradingBot:
                 except Exception as e:
                     logger.error(f"Failed to process {csv_file.name}: {e}")
 
-        self.last_refresh_date = datetime.utcnow().strftime("%Y-%m-%d")
+        self.last_refresh_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         logger.info("Data refresh complete")
 
     # ------------------------------------------------------------------
@@ -932,7 +932,7 @@ class TradingBot:
 
         try:
             positions = self.mt5.bot_positions()
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
 
             for pos in positions:
                 open_time_str = pos.get("time", "")
@@ -1001,7 +1001,7 @@ class TradingBot:
         # Clear per-cycle cache
         self._cycle_cache.clear()
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         weekday = now.weekday()
 
         # 0. Skip weekends (Sat=5, Sun=6) — most markets are closed
@@ -1243,7 +1243,7 @@ class TradingBot:
         signal.signal(signal.SIGTERM, _shutdown)
 
         # Initial data refresh
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self.last_refresh_date != today:
             try:
                 self.refresh_data()
@@ -1256,8 +1256,8 @@ class TradingBot:
         while self.running:
             try:
                 # Daily data refresh check
-                today = datetime.utcnow().strftime("%Y-%m-%d")
-                current_hour = datetime.utcnow().hour
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                current_hour = datetime.now(timezone.utc).hour
 
                 if self.last_refresh_date != today and current_hour >= self.config["DAILY_REFRESH_HOUR"]:
                     logger.info("New trading day – refreshing data...")
@@ -1279,7 +1279,7 @@ class TradingBot:
                 # Execute trade cycle
                 cycle_count += 1
                 logger.info(f"\n{'='*60}")
-                logger.info(f"CYCLE #{cycle_count} | {datetime.utcnow():%Y-%m-%d %H:%M:%S UTC}")
+                logger.info(f"CYCLE #{cycle_count} | {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S UTC}")
                 logger.info(f"{'='*60}")
 
                 self.execute_cycle()

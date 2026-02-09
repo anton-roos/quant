@@ -6,8 +6,8 @@ and any future experiment scripts all produce architecturally identical
 models.
 """
 
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv1D, LSTM, Dense, BatchNormalization
+from keras.models import Sequential
+from keras.layers import Conv1D, LSTM, Dense, BatchNormalization
 
 from src.models.layers import MCDropout
 

@@ -1,3 +1,4 @@
+import datetime
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
@@ -6,9 +7,7 @@ from pydantic_settings import BaseSettings
 from typing import Optional
 import numpy as np
 import asyncio
-import json
 import secrets
-import os
 
 from .models import (
     PlaceOrderRequest, ModifyOrderRequest, CloseOrderRequest, CancelOrderRequest,

@@ -8,7 +8,7 @@ bugs caused by diverging class definitions.
 """
 
 import tensorflow as tf
-from tensorflow.keras.layers import Dropout, Layer
+from keras.layers import Dropout, Layer
 
 
 class MCDropout(Dropout):
