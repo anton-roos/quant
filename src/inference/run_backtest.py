@@ -28,11 +28,13 @@ forecast_dir = PROJECT_ROOT / "outputs" / "forecasts"
 os.makedirs(video_dir, exist_ok=True)
 os.makedirs(forecast_dir, exist_ok=True)
 
-# Config
+# Config — aligned with live bot (config/bot_config.json)
 initial_value   = 1.0
 random_runs     = 50
 MIN_ACCEPTED    = 0.10      # Only trade when model is highly confident
 STD_FACTOR      = 1.0       # AdjustedProb = PredProb - STD_FACTOR * StdDev (penalize uncertainty)
+MAX_CONCURRENT  = 3         # Max simultaneous positions (must match bot)
+SLIPPAGE_BPS    = 5         # Round-trip spread + slippage cost in basis points
 
 # Backtest horizons
 PERIODS = {
@@ -84,12 +86,14 @@ if not common_dates:
     sys.exit(0)
 
 
-# Backtesting strategy:
+# Backtesting strategy (aligned with live bot logic):
 # Rules:
 #   For each date, compute adj_prob = Pred_Prob - STD_FACTOR * Pred_Prob_Std
 #   Reject candidates with adj_prob <= MIN_ACCEPTED
-#   Out of all candidates, choose the one with the highest adj_prob
-#   Only hold 1 position at a time
+#   Hold up to MAX_CONCURRENT positions simultaneously
+#   Skip symbols that already have an open position
+#   Apply spread/slippage cost to each trade
+#   Each position gets an equal share of capital (1/MAX_CONCURRENT)
 
 strategy_value  = initial_value
 strategy_history = []
@@ -97,47 +101,68 @@ trade_log        = []
 buy_points       = []
 sell_points      = []
 
-current_hold = None
+# Active positions: list of dicts with exit_idx, allocated capital fraction, etc.
+active_positions = []
 successful_trades = 0
 total_trades      = 0
 
-for i, date in enumerate(common_dates):
-    # Exit if horizon has expired
-    if current_hold is not None and i == current_hold["exit_idx"]:
+# Slippage cost as a multiplier (applied once at entry — covers round-trip spread)
+slippage_mult = 1.0 - (SLIPPAGE_BPS / 10000.0)
 
-        realized_logr = current_hold["Actual_LogR"]
-        side = current_hold["Side"]
+for i, date in enumerate(common_dates):
+    # ------- Check for position exits -------
+    positions_to_close = []
+    for pos_idx, pos in enumerate(active_positions):
+        if i >= pos["exit_idx"]:
+            positions_to_close.append(pos_idx)
+
+    # Close expired positions (iterate in reverse to preserve indices)
+    for pos_idx in sorted(positions_to_close, reverse=True):
+        pos = active_positions.pop(pos_idx)
+
+        realized_logr = pos["Actual_LogR"]
+        side = pos["Side"]
 
         # For SELL trades, profit is the inverse of the log return
         effective_logr = -realized_logr if side == "SELL" else realized_logr
-        realized_pct  = np.exp(effective_logr) - 1 if not np.isnan(effective_logr) else np.nan
+
+        # Apply slippage cost
+        effective_return = np.exp(effective_logr) * slippage_mult - 1.0 if not np.isnan(effective_logr) else np.nan
+
+        # This position's P&L in portfolio terms (weighted by allocation)
+        alloc = pos["Allocation"]
 
         trade_log.append({
-            "BuyDate"        : current_hold["BuyDate"],
+            "BuyDate"        : pos["BuyDate"],
             "SellDate"       : date,
-            "Symbol"         : current_hold["Symbol"],
+            "Symbol"         : pos["Symbol"],
             "Side"           : side,
-            "Horizon"        : current_hold["Period"],
-            "DaysHeld"       : current_hold["Days"],
-            "Pred_Prob"      : current_hold["Pred_Prob"],
-            "Pred_Prob_Std"  : current_hold["Pred_Prob_Std"],
-            "Adj_Prob"       : current_hold["Adj_Prob"],
+            "Horizon"        : pos["Period"],
+            "DaysHeld"       : pos["Days"],
+            "Pred_Prob"      : pos["Pred_Prob"],
+            "Pred_Prob_Std"  : pos["Pred_Prob_Std"],
+            "Adj_Prob"       : pos["Adj_Prob"],
             "Actual_LogR"    : realized_logr,
-            "Effective_LogR"  : effective_logr,
-            "Actual_Return%" : realized_pct * 100 if not np.isnan(realized_pct) else np.nan,
+            "Effective_Return%" : effective_return * 100 if not np.isnan(effective_return) else np.nan,
+            "Allocation"     : alloc,
         })
 
-        if not np.isnan(effective_logr):
-            strategy_value *= np.exp(effective_logr)
-            if effective_logr > 0:
+        if not np.isnan(effective_return):
+            # Apply weighted return to portfolio
+            strategy_value *= (1.0 + effective_return * alloc)
+            if effective_return > 0:
                 successful_trades += 1
 
-        current_hold = None
+        total_trades += 1
 
-    # If still holding a position, skip new entries
-    if current_hold is not None:
+    # ------- Check for new entries -------
+    slots_available = MAX_CONCURRENT - len(active_positions)
+    if slots_available <= 0:
         strategy_history.append(strategy_value)
         continue
+
+    # Symbols currently in open positions (no duplicates, matching live bot)
+    open_symbols = {pos["Symbol"] for pos in active_positions}
 
     # Build candidates for today (both BUY and SELL)
     candidates = []
@@ -145,6 +170,10 @@ for i, date in enumerate(common_dates):
     for symbol, df in all_forecasts.items():
 
         if date not in df.index:
+            continue
+
+        # Skip if already holding this symbol
+        if symbol in open_symbols:
             continue
 
         row = df.loc[date]
@@ -203,32 +232,49 @@ for i, date in enumerate(common_dates):
         strategy_history.append(strategy_value)
         continue
 
-    # Selecting best candidate (highest adj_prob regardless of side)
-    best = max(candidates, key=lambda x: x["Adj_Prob"])
+    # Sort by adj_prob descending (best signals first), fill available slots
+    candidates.sort(key=lambda x: x["Adj_Prob"], reverse=True)
 
-    entry_idx = i
-    exit_idx  = min(i + best["Days"], len(common_dates) - 1)
+    filled = 0
+    for best in candidates:
+        if filled >= slots_available:
+            break
 
-    best["entry_idx"] = entry_idx
-    best["exit_idx"]  = exit_idx
-    best["BuyDate"]   = date
+        # Skip if this symbol was just added in this same loop iteration
+        if best["Symbol"] in open_symbols:
+            continue
 
-    current_hold = best
-    total_trades  += 1
+        entry_idx = i
+        exit_idx  = min(i + best["Days"], len(common_dates) - 1)
 
-    entry_point = {
-        "Date"        : date,
-        "Value"       : strategy_value,
-        "Symbol"      : best["Symbol"],
-        "Horizon"     : best["Period"],
-        "Pred_Prob"   : best["Pred_Prob"],
-        "Adj_Prob"    : best["Adj_Prob"],
-    }
+        # Each position gets equal allocation (1/MAX_CONCURRENT of portfolio)
+        alloc = 1.0 / MAX_CONCURRENT
 
-    if best["Side"] == "BUY":
-        buy_points.append(entry_point)
-    else:
-        sell_points.append(entry_point)
+        position = {
+            **best,
+            "entry_idx"  : entry_idx,
+            "exit_idx"   : exit_idx,
+            "BuyDate"    : date,
+            "Allocation" : alloc,
+        }
+
+        active_positions.append(position)
+        open_symbols.add(best["Symbol"])
+        filled += 1
+
+        entry_point = {
+            "Date"        : date,
+            "Value"       : strategy_value,
+            "Symbol"      : best["Symbol"],
+            "Horizon"     : best["Period"],
+            "Pred_Prob"   : best["Pred_Prob"],
+            "Adj_Prob"    : best["Adj_Prob"],
+        }
+
+        if best["Side"] == "BUY":
+            buy_points.append(entry_point)
+        else:
+            sell_points.append(entry_point)
 
     strategy_history.append(strategy_value)
 
@@ -273,44 +319,54 @@ for date in common_dates:
 
 # Build strategy entry schedule from buy_points + sell_points
 date_to_idx = {d: i for i, d in enumerate(common_dates)}
-strategy_entries = {}
+strategy_entries = {}   # idx -> list of {horizon, side}
 for bp in buy_points:
     idx = date_to_idx[bp["Date"]]
-    strategy_entries[idx] = {"horizon": bp["Horizon"], "side": "BUY"}
+    strategy_entries.setdefault(idx, []).append({"horizon": bp["Horizon"], "side": "BUY"})
 for sp in sell_points:
     idx = date_to_idx[sp["Date"]]
-    strategy_entries[idx] = {"horizon": sp["Horizon"], "side": "SELL"}
+    strategy_entries.setdefault(idx, []).append({"horizon": sp["Horizon"], "side": "SELL"})
 
 random_results = np.zeros((len(common_dates), random_runs))
 
 for run in range(random_runs):
     value = initial_value
-    hold_exit_idx = -1
-    pending_ret = np.nan
+    # Track multiple concurrent positions: list of (exit_idx, pending_ret, allocation)
+    rand_positions = []
 
     for i, date in enumerate(common_dates):
-        # Exit current position if horizon expired
-        if i == hold_exit_idx:
-            if not np.isnan(pending_ret):
-                value *= np.exp(pending_ret)
-            hold_exit_idx = -1
-            pending_ret = np.nan
+        # Exit expired positions
+        to_close = [p for p in rand_positions if i >= p["exit_idx"]]
+        for p in to_close:
+            rand_positions.remove(p)
+            if not np.isnan(p["ret"]):
+                value *= (1.0 + p["ret"] * p["alloc"])
 
-        # Enter new position when strategy would (same timing, random symbol & side)
-        if i in strategy_entries and hold_exit_idx == -1:
-            entry_info = strategy_entries[i]
-            horizon = entry_info["horizon"]
-            days = PERIODS[horizon]
-            hold_exit_idx = min(i + days, len(common_dates) - 1)
+        # Enter new positions when strategy would (same timing, concurrent slots)
+        if i in strategy_entries:
+            for entry_info in strategy_entries[i]:
+                if len(rand_positions) >= MAX_CONCURRENT:
+                    break
 
-            rets = available_returns[date][horizon]
-            if rets:
-                raw_ret = random.choice(rets)
-                # Random baseline also randomly picks BUY or SELL direction
-                rand_side = random.choice(["BUY", "SELL"])
-                pending_ret = raw_ret if rand_side == "BUY" else -raw_ret
-            else:
-                pending_ret = np.nan
+                horizon = entry_info["horizon"]
+                days = PERIODS[horizon]
+                exit_idx = min(i + days, len(common_dates) - 1)
+
+                rets = available_returns[date][horizon]
+                if rets:
+                    raw_ret = random.choice(rets)
+                    rand_side = random.choice(["BUY", "SELL"])
+                    effective = raw_ret if rand_side == "BUY" else -raw_ret
+                    # Apply slippage
+                    effective_return = (np.exp(effective) * slippage_mult - 1.0)
+                else:
+                    effective_return = np.nan
+
+                rand_positions.append({
+                    "exit_idx": exit_idx,
+                    "ret": effective_return,
+                    "alloc": 1.0 / MAX_CONCURRENT,
+                })
 
         random_results[i, run] = value
 
@@ -344,6 +400,8 @@ else:
 print(f"\n{'='*60}")
 print(f" BACKTEST PERFORMANCE SUMMARY")
 print(f"{'='*60}")
+print(f" Max Concurrent Positions: {MAX_CONCURRENT}")
+print(f" Slippage (round-trip):    {SLIPPAGE_BPS} bps")
 print(f" Strategy Final Value:    {strat_final:.4f}  ({(strat_final-1)*100:+.1f}%)")
 print(f" Random Mean Final Value: {rand_final:.4f}  ({(rand_final-1)*100:+.1f}%)")
 print(f" Strategy Annualized:     {strat_ann:+.2f}%")

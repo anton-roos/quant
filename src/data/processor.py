@@ -36,6 +36,9 @@ os.makedirs(PROCESSED_DIR, exist_ok=True)
 
 _cross_asset_cache = {}  # symbol -> DataFrame with 'date' + return cols
 
+# Set of MT5 symbol names that map to cross-asset references (for refresh ordering)
+CROSS_ASSET_MT5_NAMES = {"EURUSD", "Gold", "SP_500", "Bitcoin (BTCUSD)", "Nymex_Light_Crude"}
+
 CROSS_ASSET_REFS = {
     # Gold as risk-off proxy
     "Gold":         ("commodities", "Gold_daily"),
@@ -48,6 +51,12 @@ CROSS_ASSET_REFS = {
     # Oil as macro proxy
     "Oil":          ("commodities", "Nymex_Light_Crude_daily"),
 }
+
+
+def invalidate_cross_asset_cache():
+    """Clear the cross-asset cache so it's reloaded from fresh files on next use."""
+    global _cross_asset_cache
+    _cross_asset_cache = {}
 
 
 def _load_cross_asset_series():
@@ -255,6 +264,14 @@ def process_file(csv_path, output_path):
     # ==== CROSS-ASSET / INTER-MARKET FEATURES ====
     cross_assets = _load_cross_asset_series()
     df = add_cross_asset_features(df, cross_assets)
+
+    # ==== ASSET CLASS ONE-HOT ENCODING ====
+    # Infer asset class from the parent directory of the raw CSV
+    category_folder = Path(csv_path).parent.name.lower()
+    category_map = {"forex": "forex", "indices": "index", "commodities": "commodity", "crypto": "crypto"}
+    asset_class = category_map.get(category_folder, "other")
+    for cls in ["forex", "index", "commodity", "crypto"]:
+        df[f"asset_{cls}"] = 1.0 if asset_class == cls else 0.0
 
     df.dropna(inplace=True)
     

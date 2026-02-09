@@ -40,6 +40,7 @@ import shutil
 import time
 import pickle
 import json
+import hashlib
 
 # Configure logging
 logging.basicConfig(
@@ -77,6 +78,9 @@ CONFIG["CACHE_DIR"].mkdir(exist_ok=True)
 # Globals
 scaler = StandardScaler()
 feature_cols = None
+# Thresholds computed from training data only (no leakage)
+global_thresholds_up = None    # {"1d": float, "1w": float, ...}
+global_thresholds_down = None  # {"1d": float, "1w": float, ...}
 
 logger.info(f"Config: {CONFIG}")
 
@@ -100,13 +104,24 @@ def mc_dropout_predict(model, X, n_samples=50):
 # DATA PROCESSING HELPERS
 # ============================================================================
 
-def compute_horizon_thresholds(df):
-    """Compute required return thresholds for each horizon (2 sigma above/below average)"""
+def compute_horizon_thresholds(df, train_cutoff=None):
+    """Compute required return thresholds for each horizon (2 sigma above/below average).
+    
+    If train_cutoff is provided, only uses data before the cutoff to prevent
+    leaking future test-set statistics into the training labels.
+    """
+    if train_cutoff is not None:
+        df_train = df[df["date"] < train_cutoff]
+        if df_train.empty:
+            df_train = df  # Fallback if instrument has no training data
+    else:
+        df_train = df
+
     thresholds_up = {}
     thresholds_down = {}
     for h in ["1d", "1w", "1m", "6m"]:
-        mu = df[f"Target_{h}"].mean()
-        sig = df[f"Target_{h}"].std()
+        mu = df_train[f"Target_{h}"].mean()
+        sig = df_train[f"Target_{h}"].std()
         thresholds_up[h] = mu + 2 * sig
         thresholds_down[h] = mu - 2 * sig
     return thresholds_up, thresholds_down
@@ -125,11 +140,18 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def process_instrument(csv_path: Path, for_training=True):
     """Process instrument data into sliding windows"""
+    global global_thresholds_up, global_thresholds_down
+
     df = pd.read_csv(csv_path, parse_dates=["date"]).sort_values("date").reset_index(drop=True)
     df = add_features(df)
 
-    # Compute thresholds (upside and downside)
-    thresholds_up, thresholds_down = compute_horizon_thresholds(df)
+    # Use pre-computed global thresholds (training-only) if available,
+    # otherwise fall back to per-instrument thresholds (no cutoff).
+    if global_thresholds_up is not None and global_thresholds_down is not None:
+        thresholds_up = global_thresholds_up
+        thresholds_down = global_thresholds_down
+    else:
+        thresholds_up, thresholds_down = compute_horizon_thresholds(df)
 
     # Create binary classification targets (upside and downside)
     for h in ["1d", "1w", "1m", "6m"]:
@@ -392,6 +414,7 @@ def main():
     logger.info("Step 1: Determining global cutoffs and fitting scaler...")
     
     global global_min_date, global_max_date, feature_cols, scaler
+    global global_thresholds_up, global_thresholds_down
     
     global_min_date, global_max_date = None, None
     scaler_inputs = []
@@ -426,6 +449,35 @@ def main():
     X = np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
     scaler.fit(X)
     logger.info(f"Fitted scaler. n_features: {len(feature_cols)}")
+
+    # ========================================================================
+    # STEP 1b: Compute classification thresholds from TRAINING data only
+    # ========================================================================
+    logger.info("Step 1b: Computing target thresholds from training data only...")
+    
+    all_targets = {f"Target_{h}": [] for h in ["1d", "1w", "1m", "6m"]}
+    for csv_path in all_csvs:
+        df = pd.read_csv(csv_path, parse_dates=["date"]).sort_values("date").dropna()
+        df = add_features(df)
+        if df.empty:
+            continue
+        train_rows = df[df["date"] < train_cutoff]
+        if len(train_rows) == 0:
+            continue
+        for h in ["1d", "1w", "1m", "6m"]:
+            all_targets[f"Target_{h}"].append(train_rows[f"Target_{h}"].values)
+    
+    global_thresholds_up = {}
+    global_thresholds_down = {}
+    for h in ["1d", "1w", "1m", "6m"]:
+        vals = np.concatenate(all_targets[f"Target_{h}"])
+        mu = np.nanmean(vals)
+        sig = np.nanstd(vals)
+        global_thresholds_up[h] = mu + 2 * sig
+        global_thresholds_down[h] = mu - 2 * sig
+        logger.info(f"  {h}: up_thresh={global_thresholds_up[h]:.6f}, down_thresh={global_thresholds_down[h]:.6f} (mu={mu:.6f}, sig={sig:.6f})")
+    
+    logger.info("Thresholds computed from training data only (no leakage)")
 
     # ========================================================================
     # STEP 2: Cache preprocessed data
@@ -520,6 +572,20 @@ def main():
     with open(CONFIG["MODEL_DIR"] / "feature_cols.json", "w") as f:
         json.dump(feature_cols, f)
     logger.info(f"Saved feature_cols to {CONFIG['MODEL_DIR'] / 'feature_cols.json'}")
+    
+    # Save feature version hash (detects processor changes vs saved scaler)
+    feature_hash = hashlib.sha256(json.dumps(sorted(feature_cols)).encode()).hexdigest()[:16]
+    with open(CONFIG["MODEL_DIR"] / "feature_hash.txt", "w") as f:
+        f.write(feature_hash)
+    logger.info(f"Saved feature hash: {feature_hash}")
+    
+    thresholds_artifact = {
+        "thresholds_up": global_thresholds_up,
+        "thresholds_down": global_thresholds_down,
+    }
+    with open(CONFIG["MODEL_DIR"] / "thresholds.json", "w") as f:
+        json.dump(thresholds_artifact, f, indent=2)
+    logger.info(f"Saved thresholds to {CONFIG['MODEL_DIR'] / 'thresholds.json'}")
 
     # Save training history plot
     plt.figure(figsize=(10, 6))

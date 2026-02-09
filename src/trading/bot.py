@@ -40,6 +40,8 @@ from tensorflow.keras.models import load_model
 from tensorflow.keras.layers import Dropout
 
 from src.trading.mt5_client import MT5Client
+from src.trading.trade_journal import TradeJournal
+from src.trading.notifications import Notifier
 from src.data.processor import process_file
 from src.data.features.mt5_bridge_downloader import _sanitize_filename
 
@@ -106,6 +108,44 @@ DEFAULT_CONFIG = {
     "ATR_TP_MULTIPLIER": 3.0,          # TP = ATR * multiplier (1.5× reward/risk)
     "MAX_DRAWDOWN_PCT": 15.0,          # Halt trading if drawdown exceeds this
 
+    # Correlation filter
+    "CORRELATION_THRESHOLD": 0.7,       # Reject if corr > this with an open position
+    "CORRELATION_LOOKBACK": 60,         # Rolling window (trading days) for correlation
+
+    # Trailing stop
+    "TRAILING_STOP_ENABLED": True,
+    "BREAKEVEN_AFTER_R": 1.0,           # Move SL to breakeven after this many R of profit
+    "TRAILING_ATR_MULTIPLIER": 1.5,     # Trail SL at this × ATR below/above current price
+
+    # Spread / liquidity gate
+    "MAX_SPREAD_ATR_RATIO": 0.15,      # Skip entry if spread > ATR * this ratio
+
+    # Weekend gap-risk protection
+    "CLOSE_BEFORE_WEEKEND": True,       # Flatten positions Friday afternoon
+    "FRIDAY_CLOSE_HOUR_UTC": 20,        # Hour (UTC) on Friday to close all positions
+
+    # Regime / volatility filter
+    "VOLATILITY_FILTER_ENABLED": True,
+    "ATR_PERCENTILE_LOW": 10,           # Skip if ATR percentile < this (dead market)
+    "ATR_PERCENTILE_HIGH": 95,          # Skip if ATR percentile > this (crisis)
+    "ATR_PERCENTILE_LOOKBACK": 252,     # Trading days for percentile calc
+
+    # Horizon weighting (prefer shorter-horizon signals)
+    "HORIZON_WEIGHTS": {"1d": 1.5, "1w": 1.2, "1m": 1.0, "6m": 0.6},
+
+    # Walk-forward retrain
+    "RETRAIN_ENABLED": True,
+    "RETRAIN_INTERVAL_DAYS": 30,
+
+    # Notifications (empty = disabled)
+    "NOTIFY_WEBHOOK_URL": "",           # Discord / Slack / Telegram webhook URL
+    "NOTIFY_ON_TRADE": True,
+    "NOTIFY_ON_DRAWDOWN": True,
+    "NOTIFY_ON_ERROR": True,
+
+    # State persistence
+    "STATE_FILE": "outputs/bot_state.json",
+
     # Scheduling
     "CHECK_INTERVAL_SECONDS": 300,     # 5 minutes between cycles
     "DAILY_REFRESH_HOUR": 0,           # Hour (UTC) to refresh candles & reprocess
@@ -139,6 +179,7 @@ class TradingBot:
         self.running = False
         self.start_equity: Optional[float] = None
         self.peak_equity: Optional[float] = None
+        self._cycle_cache: Dict[str, pd.DataFrame] = {}  # Per-cycle CSV cache
         self.last_refresh_date: Optional[str] = None
 
         # Load bridge client
@@ -157,6 +198,18 @@ class TradingBot:
 
         self._load_artifacts()
         self._load_symbols()
+
+        # Trade journal
+        self.journal = TradeJournal()
+
+        # Notifications
+        self.notifier = Notifier(self.config.get("NOTIFY_WEBHOOK_URL", ""))
+
+        # Restore persisted state (drawdown tracking, last refresh, etc.)
+        self._load_state()
+
+        # Compile MC prediction as tf.function for speed
+        self._mc_predict_fn = tf.function(lambda x: self.model(x, training=True))
 
     # ------------------------------------------------------------------
     # Artifact loading
@@ -203,6 +256,42 @@ class TradingBot:
             self.symbol_name_map[safe_name] = mt5_name
 
         logger.info(f"Loaded {len(self.symbols)} symbols")
+
+    # ------------------------------------------------------------------
+    # State persistence
+    # ------------------------------------------------------------------
+    def _load_state(self):
+        """Restore persisted bot state (equity tracking, last refresh date)."""
+        state_path = PROJECT_ROOT / self.config.get("STATE_FILE", "outputs/bot_state.json")
+        if state_path.exists():
+            try:
+                with open(state_path, "r") as f:
+                    state = json.load(f)
+                self.start_equity = state.get("start_equity")
+                self.peak_equity = state.get("peak_equity")
+                self.last_refresh_date = state.get("last_refresh_date")
+                logger.info(
+                    f"Restored bot state: start_equity={self.start_equity}, "
+                    f"peak_equity={self.peak_equity}, last_refresh={self.last_refresh_date}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to load bot state: {e}")
+
+    def _save_state(self):
+        """Persist bot state to disk for safe restarts."""
+        state_path = PROJECT_ROOT / self.config.get("STATE_FILE", "outputs/bot_state.json")
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            state = {
+                "start_equity": self.start_equity,
+                "peak_equity": self.peak_equity,
+                "last_refresh_date": self.last_refresh_date,
+                "saved_at": datetime.utcnow().isoformat(),
+            }
+            with open(state_path, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save bot state: {e}")
 
     # ------------------------------------------------------------------
     # Data refresh: download latest candles & reprocess
@@ -278,16 +367,27 @@ class TradingBot:
     # ------------------------------------------------------------------
     # Inference: generate predictions for all symbols
     # ------------------------------------------------------------------
+    def _get_cached_df(self, csv_path: Path) -> Optional[pd.DataFrame]:
+        """Return a cached DataFrame for the given CSV, reading from disk once per cycle."""
+        key = str(csv_path)
+        if key not in self._cycle_cache:
+            if not csv_path.exists():
+                self._cycle_cache[key] = None
+                return None
+            self._cycle_cache[key] = pd.read_csv(csv_path, parse_dates=["date"]).sort_values("date").reset_index(drop=True)
+        return self._cycle_cache.get(key)
+
     def _prepare_features(self, csv_path: Path) -> Optional[Tuple[np.ndarray, pd.DataFrame]]:
         """
         Read a processed CSV, apply the saved scaler, and return the
         latest window of features ready for model prediction.
         Returns (X_window, df) or None if insufficient data.
         """
-        if not csv_path.exists():
+        df = self._get_cached_df(csv_path)
+        if df is None:
             return None
 
-        df = pd.read_csv(csv_path, parse_dates=["date"]).sort_values("date").reset_index(drop=True)
+        df = df.copy()
 
         # Add target columns (needed by the pipeline even though we don't use them)
         df["Target_1d"] = np.log(df["close"].shift(-1) / df["close"])
@@ -317,9 +417,12 @@ class TradingBot:
         return X, df
 
     def _mc_predict(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Run MC Dropout inference and return (mean_probs, std_probs)."""
+        """Run MC Dropout inference and return (mean_probs, std_probs).
+        
+        Uses tf.function-compiled forward pass for speed.
+        """
         n_samples = self.config["MC_DROPOUT_SAMPLES"]
-        preds = np.array([self.model(X, training=True).numpy() for _ in range(n_samples)])
+        preds = np.array([self._mc_predict_fn(X).numpy() for _ in range(n_samples)])
         return preds.mean(axis=0), preds.std(axis=0)
 
     def generate_signals(self) -> List[Dict]:
@@ -351,6 +454,21 @@ class TradingBot:
             # Get the latest close and ATR for position sizing
             latest_close = float(df["close"].iloc[-1])
             latest_atr = float(df.get("ATR_14", pd.Series([0])).iloc[-1]) if "ATR_14" in df.columns else 0
+
+            # --- Volatility / regime filter ---
+            if self.config.get("VOLATILITY_FILTER_ENABLED", False) and "ATR_14" in df.columns:
+                lookback = self.config.get("ATR_PERCENTILE_LOOKBACK", 252)
+                atr_series = df["ATR_14"].dropna().iloc[-lookback:]
+                if len(atr_series) > 20:
+                    pctile = float((atr_series < latest_atr).sum() / len(atr_series) * 100)
+                    lo = self.config.get("ATR_PERCENTILE_LOW", 10)
+                    hi = self.config.get("ATR_PERCENTILE_HIGH", 95)
+                    if pctile < lo or pctile > hi:
+                        logger.debug(
+                            f"  Skipping {mt5_name}: ATR percentile {pctile:.0f}% "
+                            f"outside [{lo}, {hi}]"
+                        )
+                        continue
 
             for i, h in enumerate(horizons):
                 # --- BUY signal (upside probability, outputs 0..3) ---
@@ -393,15 +511,87 @@ class TradingBot:
                         "type": sym.get("type", "Unknown"),
                     })
 
-        # Sort by adj_prob descending (best signals first)
-        candidates.sort(key=lambda x: x["adj_prob"], reverse=True)
+        # Apply horizon weights to ranking score
+        horizon_weights = self.config.get("HORIZON_WEIGHTS", {"1d": 1.5, "1w": 1.2, "1m": 1.0, "6m": 0.6})
+        for c in candidates:
+            c["weighted_score"] = c["adj_prob"] * horizon_weights.get(c["horizon"], 1.0)
+
+        # Sort by weighted score descending (best signals first)
+        candidates.sort(key=lambda x: x["weighted_score"], reverse=True)
         return candidates
 
     # ------------------------------------------------------------------
     # Risk management & position sizing
     # ------------------------------------------------------------------
-    def _compute_lot_size(self, symbol_info: Dict, atr: float, close: float) -> float:
-        """Compute position size based on risk % of equity and ATR-based stop."""
+    def _get_profit_currency_rate(self, symbol_info: Dict, candidate_type: str) -> float:
+        """
+        Get the exchange rate to convert 1 unit of profit currency into account currency.
+
+        For forex pairs the profit currency is the quote currency (last 3 chars).
+        For indices/commodities/crypto the P&L is typically in the account currency
+        already (USD-denominated instruments on a USD account).
+
+        Returns the multiplier: loss_in_account = loss_in_profit_ccy / rate
+        (i.e. rate = profit_ccy per 1 account_ccy, so we *divide* by it).
+        Returns 1.0 as a safe fallback.
+        """
+        try:
+            # Determine account currency
+            acct = self.mt5.account_info()
+            account_ccy = acct.get("currency", "USD").upper()
+
+            # Determine profit (quote) currency
+            profit_ccy = symbol_info.get("currency_profit", "").upper()
+
+            # If broker reports a real currency (not "INT"), use it directly
+            if not profit_ccy or profit_ccy == "INT":
+                name = symbol_info.get("name", "")
+                # Standard forex: 6-char alphabetic name → quote ccy is chars 3-6
+                if len(name) == 6 and name.isalpha():
+                    profit_ccy = name[3:6].upper()
+                elif candidate_type == "Forex" and len(name) >= 6:
+                    # Try extracting from longer names (e.g. with suffixes)
+                    profit_ccy = name[3:6].upper()
+                else:
+                    # Non-forex (indices, commodities, crypto) – typically USD P&L
+                    profit_ccy = "USD"
+
+            if profit_ccy == account_ccy:
+                return 1.0
+
+            # Fetch conversion rate: we need profit_ccy → account_ccy.
+            # Try direct pair: profit_ccy + account_ccy  (e.g. JPYUSD doesn't exist)
+            # and inverse pair: account_ccy + profit_ccy  (e.g. USDJPY)
+            for attempt_symbol, invert in [
+                (f"{profit_ccy}{account_ccy}", False),
+                (f"{account_ccy}{profit_ccy}", True),
+            ]:
+                try:
+                    q = self.mt5.quote(attempt_symbol)
+                    bid = q.get("bid", 0)
+                    if bid and bid > 0:
+                        return (1.0 / bid) if invert else bid
+                except Exception:
+                    continue
+
+            logger.debug(
+                f"Could not find conversion rate for {profit_ccy}→{account_ccy}, "
+                f"assuming 1.0"
+            )
+            return 1.0
+
+        except Exception as e:
+            logger.debug(f"Profit currency rate lookup failed: {e}, assuming 1.0")
+            return 1.0
+
+    def _compute_lot_size(self, symbol_info: Dict, atr: float, close: float,
+                          candidate_type: str = "Forex") -> float:
+        """Compute position size based on risk % of equity and ATR-based stop.
+        
+        Converts the SL distance into account-currency risk using the profit
+        currency exchange rate, so cross-currency pairs (e.g. GBPJPY on a USD
+        account) are sized correctly.
+        """
         try:
             acct = self.mt5.account_info()
             equity = acct["equity"]
@@ -411,18 +601,20 @@ class TradingBot:
             if sl_distance <= 0:
                 return self.config["DEFAULT_LOT_SIZE"]
 
-            # Approximate: lot_size = risk_amount / (sl_distance * contract_size)
             contract_size = symbol_info.get("trade_contract_size", 100000)
-            point = symbol_info.get("point", 0.00001)
-            digits = symbol_info.get("digits", 5)
 
-            # sl_distance is in price units; convert to monetary loss per lot
-            loss_per_lot = sl_distance * contract_size
+            # sl_distance is in price (quote) units → monetary loss per 1 lot
+            # in the instrument's profit currency
+            loss_per_lot_profit_ccy = sl_distance * contract_size
 
-            if loss_per_lot <= 0:
+            # Convert to account currency
+            profit_rate = self._get_profit_currency_rate(symbol_info, candidate_type)
+            loss_per_lot_account = loss_per_lot_profit_ccy * profit_rate
+
+            if loss_per_lot_account <= 0:
                 return self.config["DEFAULT_LOT_SIZE"]
 
-            lot_size = risk_amount / loss_per_lot
+            lot_size = risk_amount / loss_per_lot_account
 
             # Clamp to broker limits
             vol_min = symbol_info.get("volume_min", 0.01)
@@ -475,10 +667,13 @@ class TradingBot:
             if self.peak_equity > 0:
                 drawdown_pct = ((self.peak_equity - equity) / self.peak_equity) * 100
                 if drawdown_pct > self.config["MAX_DRAWDOWN_PCT"]:
-                    logger.critical(
+                    msg = (
                         f"DRAWDOWN LIMIT HIT: {drawdown_pct:.1f}% "
                         f"(max {self.config['MAX_DRAWDOWN_PCT']}%). HALTING."
                     )
+                    logger.critical(msg)
+                    if self.config.get("NOTIFY_ON_DRAWDOWN", True):
+                        self.notifier.send(f"🚨 {msg}")
                     return True
             return False
         except Exception as e:
@@ -486,10 +681,214 @@ class TradingBot:
             return False
 
     # ------------------------------------------------------------------
+    # Correlation filter
+    # ------------------------------------------------------------------
+    def _load_close_series(self, mt5_name: str) -> Optional[pd.Series]:
+        """Load the daily close price series for a symbol from processed data (cached)."""
+        safe_name = _sanitize_filename(mt5_name)
+        processed_base = PROJECT_ROOT / self.config["PROCESSED_DIR"]
+
+        # Find the symbol's type from our symbol list
+        sym_entry = next((s for s in self.symbols if s["name"] == mt5_name), None)
+        if sym_entry is None:
+            return None
+
+        cat_map = {"Forex": "forex", "Index": "indices", "Commodity": "commodities", "Crypto": "crypto"}
+        cat_folder = cat_map.get(sym_entry.get("type", ""), "other")
+        csv_path = processed_base / cat_folder / f"{safe_name}_daily_processed.csv"
+
+        df = self._get_cached_df(csv_path)
+        if df is None:
+            return None
+
+        try:
+            return df.set_index("date")["close"]
+        except Exception:
+            return None
+
+    def _is_too_correlated(
+        self,
+        candidate_name: str,
+        candidate_side: str,
+        open_positions_info: List[Dict],
+    ) -> bool:
+        """Direction-aware correlation filter.
+
+        Rejects when the candidate would add concentrated exposure:
+        - Same-direction trade on a positively correlated pair
+        - Opposite-direction trade on a negatively correlated pair
+        Both effectively double the same directional bet.
+        """
+        threshold = self.config.get("CORRELATION_THRESHOLD", 0.7)
+        lookback = self.config.get("CORRELATION_LOOKBACK", 60)
+
+        if not open_positions_info:
+            return False
+
+        cand_close = self._load_close_series(candidate_name)
+        if cand_close is None or len(cand_close) < lookback:
+            return False
+
+        cand_ret = cand_close.pct_change().iloc[-lookback:]
+
+        for open_pos in open_positions_info:
+            open_name = open_pos["symbol"]
+            open_side = open_pos.get("type", "BUY")
+
+            open_close = self._load_close_series(open_name)
+            if open_close is None or len(open_close) < lookback:
+                continue
+
+            open_ret = open_close.pct_change().iloc[-lookback:]
+
+            # Align on common dates
+            combined = pd.concat([cand_ret.rename("cand"), open_ret.rename("open")], axis=1).dropna()
+            if len(combined) < 20:
+                continue
+
+            corr = combined["cand"].corr(combined["open"])
+
+            # Determine if directions compound risk
+            same_direction = (candidate_side == open_side)
+            # Positive correlation + same direction = concentrated risk
+            # Negative correlation + opposite direction = concentrated risk
+            is_risky = (corr > threshold and same_direction) or \
+                       (corr < -threshold and not same_direction)
+
+            if is_risky:
+                logger.info(
+                    f"  Skipping {candidate_name} {candidate_side} — corr={corr:.2f} with "
+                    f"open {open_name} {open_side} (threshold={threshold})"
+                )
+                return True
+
+        return False
+
+    # ------------------------------------------------------------------
+    # Trailing stop management
+    # ------------------------------------------------------------------
+    def _manage_trailing_stops(self):
+        """Adjust SL on open bot positions: breakeven after 1R, then ATR trail."""
+        if not self.config.get("TRAILING_STOP_ENABLED", False):
+            return
+
+        try:
+            positions = self.mt5.bot_positions()
+        except Exception as e:
+            logger.error(f"Trailing stop: failed to fetch positions: {e}")
+            return
+
+        for pos in positions:
+            ticket = pos["ticket"]
+            symbol = pos["symbol"]
+            side = pos.get("type", "BUY")  # "BUY" or "SELL"
+            price_open = pos.get("price_open", 0)
+            current_sl = pos.get("sl", 0)
+
+            if not price_open:
+                continue
+
+            # Get current price and symbol info
+            try:
+                quote = self.mt5.quote(symbol)
+                sym_info = self.mt5.symbol_info(symbol)
+            except Exception as e:
+                logger.debug(f"Trailing stop: skip {symbol}, quote/info failed: {e}")
+                continue
+
+            digits = sym_info.get("digits", 5)
+            current_price = quote.get("bid", 0) if side == "BUY" else quote.get("ask", 0)
+            if not current_price:
+                continue
+
+            # Compute current ATR from processed data
+            atr = self._get_current_atr(symbol)
+            if atr <= 0:
+                continue
+
+            # Original risk (1R) = distance from entry to original SL
+            sl_multiplier = self.config["ATR_SL_MULTIPLIER"]
+            one_r = atr * sl_multiplier  # Approximate 1R from ATR
+
+            breakeven_r = self.config.get("BREAKEVEN_AFTER_R", 1.0)
+            trail_mult = self.config.get("TRAILING_ATR_MULTIPLIER", 1.5)
+            trail_distance = atr * trail_mult
+            stops_level = sym_info.get("trade_stops_level", 0) * sym_info.get("point", 0.00001)
+
+            if side == "BUY":
+                unrealized = current_price - price_open
+                # Only act if in profit by at least breakeven_r × 1R
+                if unrealized < breakeven_r * one_r:
+                    continue
+
+                # New trailing SL: current price minus trail distance
+                new_sl = round(current_price - trail_distance, digits)
+
+                # Must be at least at breakeven (entry price)
+                new_sl = max(new_sl, round(price_open, digits))
+
+                # Only move SL up, never down
+                if current_sl and new_sl <= current_sl:
+                    continue
+
+                # Respect broker minimum stop distance
+                if stops_level > 0 and (current_price - new_sl) < stops_level:
+                    new_sl = round(current_price - stops_level, digits)
+
+            else:  # SELL
+                unrealized = price_open - current_price
+                if unrealized < breakeven_r * one_r:
+                    continue
+
+                new_sl = round(current_price + trail_distance, digits)
+                new_sl = min(new_sl, round(price_open, digits))
+
+                if current_sl and current_sl != 0 and new_sl >= current_sl:
+                    continue
+
+                if stops_level > 0 and (new_sl - current_price) < stops_level:
+                    new_sl = round(current_price + stops_level, digits)
+
+            # Apply the new SL
+            try:
+                result = self.mt5.modify_position(ticket, sl=new_sl)
+                logger.info(
+                    f"  [TRAIL] {symbol} #{ticket} {side}: SL {current_sl} → {new_sl} "
+                    f"(price={current_price}, entry={price_open}, ATR={atr:.{digits}f})"
+                )
+            except Exception as e:
+                logger.warning(f"  [TRAIL] Failed to modify {symbol} #{ticket}: {e}")
+
+    def _get_current_atr(self, mt5_name: str) -> float:
+        """Get the latest ATR_14 value for a symbol from processed data (cached)."""
+        safe_name = _sanitize_filename(mt5_name)
+        processed_base = PROJECT_ROOT / self.config["PROCESSED_DIR"]
+
+        sym_entry = next((s for s in self.symbols if s["name"] == mt5_name), None)
+        if sym_entry is None:
+            return 0.0
+
+        cat_map = {"Forex": "forex", "Index": "indices", "Commodity": "commodities", "Crypto": "crypto"}
+        cat_folder = cat_map.get(sym_entry.get("type", ""), "other")
+        csv_path = processed_base / cat_folder / f"{safe_name}_daily_processed.csv"
+
+        df = self._get_cached_df(csv_path)
+        if df is None:
+            return 0.0
+
+        try:
+            if "ATR_14" in df.columns and len(df) > 0:
+                return float(df["ATR_14"].iloc[-1])
+        except Exception:
+            pass
+        return 0.0
+
+    # ------------------------------------------------------------------
     # Position management
     # ------------------------------------------------------------------
     def _review_open_positions(self):
-        """Close bot positions that have been open too long or hit conditions."""
+        """Close bot positions that have been open too long or hit conditions.
+        Records exits in the trade journal."""
         review_hours = self.config.get("POSITION_REVIEW_HOURS", 0)
         if review_hours <= 0:
             return
@@ -513,11 +912,45 @@ class TradingBot:
                         f"Position {pos['ticket']} ({pos['symbol']}) open {hours_open:.1f}h — closing (stale)"
                     )
                     try:
-                        self.mt5.close_position(pos["ticket"], comment="bot:stale")
+                        result = self.mt5.close_position(pos["ticket"], comment="bot:stale")
+                        # Record exit in journal
+                        self.journal.record_exit(
+                            ticket=pos["ticket"],
+                            exit_price=pos.get("price_current", 0),
+                            realized_pnl=pos.get("profit", 0),
+                            commission=pos.get("commission", 0),
+                            swap=pos.get("swap", 0),
+                        )
                     except Exception as e:
                         logger.error(f"Failed to close stale position {pos['ticket']}: {e}")
         except Exception as e:
             logger.error(f"Position review failed: {e}")
+
+    def _close_all_positions(self, comment: str = "bot:close_all"):
+        """Flatten all bot positions (e.g., before weekend)."""
+        try:
+            positions = self.mt5.bot_positions()
+            if not positions:
+                logger.info("No positions to close.")
+                return
+            logger.info(f"Closing all {len(positions)} bot positions ({comment})")
+            for pos in positions:
+                try:
+                    self.mt5.close_position(pos["ticket"], comment=comment)
+                    self.journal.record_exit(
+                        ticket=pos["ticket"],
+                        exit_price=pos.get("price_current", 0),
+                        realized_pnl=pos.get("profit", 0),
+                        commission=pos.get("commission", 0),
+                        swap=pos.get("swap", 0),
+                    )
+                    logger.info(f"  Closed {pos['symbol']} #{pos['ticket']}")
+                except Exception as e:
+                    logger.error(f"  Failed to close {pos['ticket']}: {e}")
+            if self.config.get("NOTIFY_ON_TRADE", True):
+                self.notifier.send(f"🏁 Closed all {len(positions)} positions: {comment}")
+        except Exception as e:
+            logger.error(f"Close all positions failed: {e}")
 
     # ------------------------------------------------------------------
     # Main trade execution cycle
@@ -528,10 +961,22 @@ class TradingBot:
         logger.info("STARTING TRADE CYCLE")
         logger.info("-" * 60)
 
+        # Clear per-cycle cache
+        self._cycle_cache.clear()
+
+        now = datetime.utcnow()
+        weekday = now.weekday()
+
         # 0. Skip weekends (Sat=5, Sun=6) — most markets are closed
-        weekday = datetime.utcnow().weekday()
         if weekday >= 5:
             logger.info(f"Weekend (day={weekday}) — skipping trade cycle")
+            return
+
+        # 0b. Friday pre-weekend close
+        if (self.config.get("CLOSE_BEFORE_WEEKEND", False)
+                and weekday == 4
+                and now.hour >= self.config.get("FRIDAY_CLOSE_HOUR_UTC", 20)):
+            self._close_all_positions("bot:weekend")
             return
 
         # 1. Check drawdown
@@ -540,6 +985,9 @@ class TradingBot:
 
         # 2. Review & close stale positions
         self._review_open_positions()
+
+        # 2b. Manage trailing stops on open positions
+        self._manage_trailing_stops()
 
         # 3. Count current bot positions
         try:
@@ -557,12 +1005,15 @@ class TradingBot:
             logger.info(f"Max positions ({max_pos}) reached — skipping signal generation")
             return
 
-        # 4. Account snapshot
+        # 4. Account snapshot + equity journal
         try:
             acct = self.mt5.account_info()
             logger.info(
                 f"Account: balance={acct['balance']:.2f} equity={acct['equity']:.2f} "
                 f"margin={acct['margin']:.2f} free_margin={acct['free_margin']:.2f}"
+            )
+            self.journal.record_equity_snapshot(
+                equity=acct["equity"], balance=acct["balance"], open_positions=n_open
             )
         except Exception as e:
             logger.error(f"Failed to get account info: {e}")
@@ -575,6 +1026,8 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Signal generation failed: {e}")
             traceback.print_exc()
+            if self.config.get("NOTIFY_ON_ERROR", True):
+                self.notifier.send(f"⚠️ Signal generation failed: {e}")
             return
 
         if not candidates:
@@ -585,6 +1038,7 @@ class TradingBot:
         for c in candidates[:10]:
             logger.info(
                 f"  {c['mt5_name']:20s} {c['horizon']:3s} adj_prob={c['adj_prob']:.4f} "
+                f"weighted={c.get('weighted_score', c['adj_prob']):.4f} "
                 f"prob={c['pred_prob']:.4f} std={c['pred_std']:.4f} ATR={c['atr']:.6f}"
             )
 
@@ -601,6 +1055,10 @@ class TradingBot:
                 logger.info(f"  Skipping {mt5_name} — already have position")
                 continue
 
+            # Direction-aware correlation filter
+            if self._is_too_correlated(mt5_name, candidate["side"], open_positions):
+                continue
+
             try:
                 sym_info = self.mt5.symbol_info(mt5_name)
             except Exception as e:
@@ -609,14 +1067,35 @@ class TradingBot:
 
             digits = sym_info.get("digits", 5)
             atr = candidate["atr"]
-            close = candidate["close"]
             side = candidate["side"]
 
-            # Compute SL/TP
-            sl, tp = self._compute_sl_tp(side, close, atr, digits)
+            # --- Spread / liquidity gate ---
+            try:
+                live_quote = self.mt5.quote(mt5_name)
+                bid = live_quote.get("bid", 0)
+                ask = live_quote.get("ask", 0)
+                spread = ask - bid
+                max_spread = atr * self.config.get("MAX_SPREAD_ATR_RATIO", 0.15)
+                if atr > 0 and spread > max_spread:
+                    logger.info(
+                        f"  Skipping {mt5_name} — spread {spread:.{digits}f} > "
+                        f"max {max_spread:.{digits}f} (ATR×{self.config.get('MAX_SPREAD_ATR_RATIO', 0.15)})"
+                    )
+                    continue
+                # Use live price for SL/TP (not stale daily close)
+                live_price = bid if side == "BUY" else ask
+                if not live_price or live_price <= 0:
+                    live_price = candidate["close"]
+            except Exception as e:
+                logger.debug(f"  Quote failed for {mt5_name}: {e}, using daily close")
+                live_price = candidate["close"]
+
+            # Compute SL/TP from live price
+            sl, tp = self._compute_sl_tp(side, live_price, atr, digits)
 
             # Compute lot size
-            lot_size = self._compute_lot_size(sym_info, atr, close)
+            lot_size = self._compute_lot_size(sym_info, atr, live_price,
+                                              candidate_type=candidate.get("type", "Forex"))
 
             # Comment with signal info
             comment = f"bot:{candidate['horizon']}:{candidate['adj_prob']:.2f}"
@@ -634,11 +1113,33 @@ class TradingBot:
                 if result.get("accepted"):
                     trades_opened += 1
                     open_symbols.add(mt5_name.upper())
-                    logger.info(
-                        f"  [OK] OPENED {side} {lot_size} {mt5_name} | "
-                        f"ticket={result.get('ticket')} price={result.get('price')} "
-                        f"SL={sl} TP={tp} | horizon={candidate['horizon']} adj_prob={candidate['adj_prob']:.4f}"
+
+                    fill_price = result.get("price", live_price)
+                    ticket = result.get("ticket", 0)
+
+                    # Record in trade journal
+                    self.journal.record_entry(
+                        ticket=ticket,
+                        symbol=mt5_name,
+                        side=side,
+                        volume=lot_size,
+                        entry_price=fill_price,
+                        sl=sl,
+                        tp=tp,
+                        horizon=candidate["horizon"],
+                        adj_prob=candidate["adj_prob"],
+                        comment=comment,
                     )
+
+                    msg = (
+                        f"[OK] OPENED {side} {lot_size} {mt5_name} | "
+                        f"ticket={ticket} price={fill_price} "
+                        f"SL={sl} TP={tp} | horizon={candidate['horizon']} "
+                        f"adj_prob={candidate['adj_prob']:.4f}"
+                    )
+                    logger.info(f"  {msg}")
+                    if self.config.get("NOTIFY_ON_TRADE", True):
+                        self.notifier.send(f"📈 {msg}")
                 else:
                     logger.warning(
                         f"  [REJECTED] {side} {mt5_name}: {result.get('message', 'unknown')}"
@@ -648,6 +1149,9 @@ class TradingBot:
                 logger.error(f"  Order failed for {mt5_name}: {e}")
 
         logger.info(f"Cycle complete: {trades_opened} new trades opened")
+
+        # Persist state after every cycle
+        self._save_state()
 
     # ------------------------------------------------------------------
     # Main loop
@@ -665,8 +1169,11 @@ class TradingBot:
             return
 
         acct = self.mt5.account_info()
-        self.start_equity = acct["equity"]
-        self.peak_equity = acct["equity"]
+        # Only overwrite equity if not restored from state
+        if self.start_equity is None:
+            self.start_equity = acct["equity"]
+        if self.peak_equity is None:
+            self.peak_equity = acct["equity"]
         logger.info(f"Starting equity: {self.start_equity:.2f}")
 
         self.running = True
@@ -703,6 +1210,10 @@ class TradingBot:
                     except Exception as e:
                         logger.error(f"Data refresh failed: {e}")
 
+                    # Walk-forward retrain check (once per day after data refresh)
+                    if self.config.get("RETRAIN_ENABLED", False):
+                        self._maybe_retrain()
+
                 # Health check before each cycle
                 if not self.mt5.is_healthy():
                     logger.warning("MT5 Bridge unhealthy – waiting...")
@@ -731,6 +1242,8 @@ class TradingBot:
             except Exception as e:
                 logger.error(f"Unhandled error in main loop: {e}")
                 traceback.print_exc()
+                if self.config.get("NOTIFY_ON_ERROR", True):
+                    self.notifier.send(f"⚠️ Bot error: {e}")
                 time.sleep(60)  # Wait before retrying
 
         logger.info("Bot stopped.")
@@ -743,8 +1256,49 @@ class TradingBot:
             pnl_pct = (pnl / self.start_equity) * 100 if self.start_equity else 0
             logger.info(f"Session P&L: {pnl:+.2f} ({pnl_pct:+.2f}%)")
             logger.info(f"Final equity: {final_equity:.2f}")
+
+            report = self.journal.format_stats_report()
+            logger.info(f"\n{report}")
         except Exception:
             pass
+
+        # Save final state and close journal
+        self._save_state()
+        self.journal.close()
+
+    # ------------------------------------------------------------------
+    # Walk-forward retrain integration
+    # ------------------------------------------------------------------
+    def _maybe_retrain(self):
+        """Trigger walk-forward retraining if due, and hot-reload the model."""
+        try:
+            from src.inference.walk_forward_retrain import retrain, is_retrain_due
+
+            interval = self.config.get("RETRAIN_INTERVAL_DAYS", 30)
+            if not is_retrain_due(interval):
+                logger.info(f"Walk-forward retrain not due (interval={interval}d)")
+                return
+
+            logger.info("Walk-forward retrain is DUE — starting retraining...")
+            if self.config.get("NOTIFY_ON_TRADE", True):
+                self.notifier.send("🔄 Walk-forward retraining started")
+
+            deployed = retrain(force=False, interval_days=interval)
+
+            if deployed:
+                logger.info("New model deployed — reloading artifacts...")
+                self._load_artifacts()
+                # Re-compile tf.function with new model
+                self._mc_predict_fn = tf.function(lambda x: self.model(x, training=True))
+                if self.config.get("NOTIFY_ON_TRADE", True):
+                    self.notifier.send("✅ New model deployed and loaded")
+            else:
+                logger.info("Retrain complete — existing model kept.")
+        except Exception as e:
+            logger.error(f"Walk-forward retrain failed: {e}")
+            traceback.print_exc()
+            if self.config.get("NOTIFY_ON_ERROR", True):
+                self.notifier.send(f"⚠️ Retrain failed: {e}")
 
 
 # ---------------------------------------------------------------------------
