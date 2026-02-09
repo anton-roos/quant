@@ -30,7 +30,7 @@ except ImportError:
 
 # Re-export ErrorCode / OrderSide from the canonical MT5 Bridge models so
 # ``from src.risk import …`` works seamlessly.
-from src.mt5_bridge.src.models import OrderSide, ErrorCode  # noqa: F401
+from src.mt5_bridge.models import OrderSide, ErrorCode  # noqa: F401
 
 
 # ---------------------------------------------------------------------------

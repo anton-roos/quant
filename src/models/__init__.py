@@ -1,6 +1,6 @@
 """Re-export model types for convenient imports (e.g. ``from src.models import OrderSide``)."""
 
-from src.mt5_bridge.src.models import (  # noqa: F401
+from src.mt5_bridge.models import (  # noqa: F401
     PlaceOrderRequest,
     ModifyOrderRequest,
     CloseOrderRequest,

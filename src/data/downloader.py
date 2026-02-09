@@ -32,7 +32,7 @@ result = subprocess.run([sys.executable, str(mt5_downloader)])
 if result.returncode != 0:
     print("\n ⚠️ MT5 Bridge downloader failed!")
     print("   Make sure:")
-    print("   1. MT5 Bridge is running: cd src/mt5_bridge && python -m uvicorn src.main:app --host 127.0.0.1 --port 8787")
+    print("   1. MT5 Bridge is running: cd src/mt5_bridge && python -m uvicorn main:app --host 127.0.0.1 --port 8787")
     print("   2. MT5 terminal is open and logged in")
     print("   3. config/symbols.json exists with your trading symbols")
     sys.exit(1)

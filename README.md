@@ -150,7 +150,7 @@ Open a **separate terminal** (this process stays running) and start the bridge:
 ```powershell
 cd src/mt5_bridge
 ..\..\..\.venv\Scripts\Activate.ps1      # or wherever your venv is
-python -m uvicorn src.main:app --host 127.0.0.1 --port 8787
+python -m uvicorn main:app --host 127.0.0.1 --port 8787
 ```
 
 You should see:
@@ -369,13 +369,12 @@ LSTM_AI_Stock_Predictor/
 │   │   └── config_validator.py       # Startup config validation
 │   │
 │   ├── mt5_bridge/                   # FastAPI bridge to MetaTrader 5
-│   │   ├── src/
-│   │   │   ├── main.py              # FastAPI app (endpoints)
-│   │   │   ├── mt5_client.py        # MT5 connection wrapper
-│   │   │   ├── models.py            # Pydantic models
-│   │   │   ├── storage.py           # Logging / persistence
-│   │   │   └── indicators.py        # Server-side indicator calc
-│   │   ├── tests/
+│   │   ├── __init__.py
+│   │   ├── main.py                  # FastAPI app (endpoints)
+│   │   ├── mt5_client.py            # MT5 connection wrapper
+│   │   ├── models.py                # Pydantic models
+│   │   ├── storage.py               # Logging / persistence
+│   │   ├── indicators.py            # Server-side indicator calc
 │   │   ├── requirements.txt         # Bridge-specific deps
 │   │   ├── .env.example             # Environment template
 │   │   ├── README.md                # Bridge docs

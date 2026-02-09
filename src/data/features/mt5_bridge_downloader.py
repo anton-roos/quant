@@ -60,7 +60,7 @@ class MT5BridgeDownloader:
                 return False
         except requests.exceptions.ConnectionError:
             print(f"❌ Cannot connect to MT5 Bridge at {self.base_url}")
-            print(f"   Make sure the bridge is running: python -m uvicorn src.main:app --host 127.0.0.1 --port 8787")
+            print(f"   Make sure the bridge is running: python -m uvicorn main:app --host 127.0.0.1 --port 8787")
             return False
         except Exception as e:
             print(f"❌ Error checking MT5 Bridge: {e}")
@@ -317,7 +317,7 @@ if __name__ == "__main__":
         print("\n⚠️  MT5 Bridge is not running or not accessible.")
         print("\nTo start the bridge:")
         print("  cd src/mt5_bridge")
-        print("  python -m uvicorn src.main:app --host 127.0.0.1 --port 8787")
+        print("  python -m uvicorn main:app --host 127.0.0.1 --port 8787")
         exit(1)
     
     # Download data for each category

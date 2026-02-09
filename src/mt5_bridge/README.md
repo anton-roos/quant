@@ -50,7 +50,7 @@ API_KEY=new_strong_key
 ### 3. Start Bridge
 
 ```powershell
-python -m uvicorn src.main:app --host 127.0.0.1 --port 8787
+python -m uvicorn main:app --host 127.0.0.1 --port 8787
 ```
 
 Or from the root directory:

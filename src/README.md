@@ -20,7 +20,7 @@ python src/inference/run_forecast.py
 python src/inference/run_backtest.py
 
 # Start MT5 API server
-cd src/mt5_bridge && python -m uvicorn src.main:app --host 127.0.0.1 --port 8787
+cd src/mt5_bridge && python -m uvicorn main:app --host 127.0.0.1 --port 8787
 
 # Process data
 python src/data/processor.py
