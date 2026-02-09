@@ -11,7 +11,8 @@ import logging
 from pathlib import Path
 
 # Set random seeds for reproducibility BEFORE importing TensorFlow/numpy
-RANDOM_SEED = 42
+from src.utils.constants import RANDOM_SEED, EXCLUDED_COLS, HORIZONS, HORIZON_DAYS, CATEGORY_FOLDERS
+
 os.environ['PYTHONHASHSEED'] = str(RANDOM_SEED)
 os.environ['TF_DETERMINISTIC_OPS'] = '1'
 
@@ -30,17 +31,21 @@ import tensorflow as tf
 tf.random.set_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv1D, LSTM, Dense, Dropout, BatchNormalization, Layer
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.metrics import AUC
 from sklearn.preprocessing import StandardScaler
 import glob
 import shutil
 import time
-import pickle
+import joblib
 import json
 import hashlib
+
+# Shared modules
+from src.models.layers import MCDropout, Attention
+from src.models.lstm import build_model
+from src.models.context import PipelineContext
+from src.config import TrainingConfig
 
 # Configure logging
 logging.basicConfig(
@@ -53,34 +58,50 @@ logger = logging.getLogger(__name__)
 # CONFIG
 # ============================================================================
 
+# ---------------------------------------------------------------------------
+# Build CONFIG dict from unified TrainingConfig
+# ---------------------------------------------------------------------------
+_training_cfg = TrainingConfig()
+_paths = _training_cfg.resolve_paths()
+
 CONFIG = {
-    "DATA_DIR": Path("src/data/indicators_data/processed"),
-    "FORECAST_DIR": Path("outputs/forecasts"),
-    "MODEL_DIR": Path("outputs/models"),
-    "CACHE_DIR": Path("outputs/cache"),
-    "WINDOW_SIZE": 90,
-    "TRAIN_VAL_FRAC": 0.8,
-    "VAL_FRAC_WITHIN_TRAIN": 0.2,
-    "MC_DROPOUT_SAMPLES": 50,
-    "EXCLUDED_COLS": ["date", "Target_1d", "Target_1w", "Target_1m", "Target_6m"],
-    "PROB_THRESHOLD": 0.7,
-    "RANDOM_SEED": RANDOM_SEED
+    "DATA_DIR": _paths["DATA_DIR"],
+    "FORECAST_DIR": _paths["FORECAST_DIR"],
+    "MODEL_DIR": _paths["MODEL_DIR"],
+    "CACHE_DIR": _paths["CACHE_DIR"],
+    "WINDOW_SIZE": _training_cfg.WINDOW_SIZE,
+    "TRAIN_VAL_FRAC": _training_cfg.TRAIN_VAL_FRAC,
+    "VAL_FRAC_WITHIN_TRAIN": _training_cfg.VAL_FRAC_WITHIN_TRAIN,
+    "MC_DROPOUT_SAMPLES": _training_cfg.MC_DROPOUT_SAMPLES,
+    "EXCLUDED_COLS": EXCLUDED_COLS,
+    "PROB_THRESHOLD": _training_cfg.PROB_THRESHOLD,
+    "RANDOM_SEED": RANDOM_SEED,
+    "MIN_VAL_AUC": _training_cfg.MIN_VAL_AUC,
+    "BATCH_SIZE": _training_cfg.BATCH_SIZE,
+    "MAX_EPOCHS": _training_cfg.MAX_EPOCHS,
+    "EARLY_STOP_PATIENCE": _training_cfg.EARLY_STOP_PATIENCE,
+    "REDUCE_LR_PATIENCE": _training_cfg.REDUCE_LR_PATIENCE,
 }
 
-horizons = ["1d", "1w", "1m", "6m"]
-horizon_days = [1, 5, 21, 126]
+horizons = HORIZONS
+horizon_days = [HORIZON_DAYS[h] for h in HORIZONS]
 
 # Ensure dirs exist
 CONFIG["FORECAST_DIR"].mkdir(exist_ok=True)
 CONFIG["MODEL_DIR"].mkdir(exist_ok=True)
 CONFIG["CACHE_DIR"].mkdir(exist_ok=True)
 
-# Globals
-scaler = StandardScaler()
+# Module-level PipelineContext — populated during main() and consumed
+# by process_instrument / process_instrument_for_inference.  The
+# walk_forward_retrain module can supply its own context to avoid
+# mutating these globals.
+_ctx = PipelineContext()
+
+# Legacy global aliases (kept for walk_forward_retrain backward compat)
+scaler = _ctx.scaler
 feature_cols = None
-# Thresholds computed from training data only (no leakage)
-global_thresholds_up = None    # {"1d": float, "1w": float, ...}
-global_thresholds_down = None  # {"1d": float, "1w": float, ...}
+global_thresholds_up = None
+global_thresholds_down = None
 
 logger.info(f"Config: {CONFIG}")
 
@@ -88,10 +109,7 @@ logger.info(f"Config: {CONFIG}")
 # MC DROPOUT
 # ============================================================================
 
-class MCDropout(Dropout):
-    """MC Dropout for uncertainty estimation"""
-    def call(self, inputs, training=None):
-        return super().call(inputs, training=True)
+# MCDropout is imported from src.models.layers (single definition)
 
 
 def mc_dropout_predict(model, X, n_samples=50):
@@ -119,7 +137,7 @@ def compute_horizon_thresholds(df, train_cutoff=None):
 
     thresholds_up = {}
     thresholds_down = {}
-    for h in ["1d", "1w", "1m", "6m"]:
+    for h in HORIZONS:
         mu = df_train[f"Target_{h}"].mean()
         sig = df_train[f"Target_{h}"].std()
         thresholds_up[h] = mu + 2 * sig
@@ -138,38 +156,56 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def process_instrument(csv_path: Path, for_training=True):
-    """Process instrument data into sliding windows"""
-    global global_thresholds_up, global_thresholds_down
+def process_instrument(csv_path: Path, for_training=True, ctx: PipelineContext = None):
+    """Process instrument data into sliding windows.
+
+    Parameters
+    ----------
+    ctx : PipelineContext, optional
+        Explicit context (scaler, feature_cols, thresholds).  When *None*
+        the module-level ``_ctx`` / legacy globals are used.
+    """
+    # Resolve context
+    if ctx is None:
+        _sc = _ctx.scaler if _ctx.feature_cols else scaler
+        _fc = _ctx.feature_cols or feature_cols
+        _tu = _ctx.thresholds_up or global_thresholds_up
+        _td = _ctx.thresholds_down or global_thresholds_down
+    else:
+        _sc = ctx.scaler
+        _fc = ctx.feature_cols
+        _tu = ctx.thresholds_up
+        _td = ctx.thresholds_down
 
     df = pd.read_csv(csv_path, parse_dates=["date"]).sort_values("date").reset_index(drop=True)
     df = add_features(df)
 
     # Use pre-computed global thresholds (training-only) if available,
     # otherwise fall back to per-instrument thresholds (no cutoff).
-    if global_thresholds_up is not None and global_thresholds_down is not None:
-        thresholds_up = global_thresholds_up
-        thresholds_down = global_thresholds_down
+    if _tu is not None and _td is not None:
+        thresholds_up = _tu
+        thresholds_down = _td
     else:
         thresholds_up, thresholds_down = compute_horizon_thresholds(df)
 
     # Create binary classification targets (upside and downside)
-    for h in ["1d", "1w", "1m", "6m"]:
+    for h in HORIZONS:
         df[f"Class_{h}"] = (df[f"Target_{h}"] > thresholds_up[h]).astype(int)
         df[f"Class_{h}_down"] = (df[f"Target_{h}"] < thresholds_down[h]).astype(int)
         
     if df.empty:
         return np.array([]), np.array([]), df, np.array([])
 
-    global feature_cols
-    for col in feature_cols:
+    for col in _fc:
         if col not in df.columns:
             df[col] = 0.0
 
-    features_scaled = scaler.transform(df[feature_cols].values)
+    features_scaled = _sc.transform(df[_fc].values)
     dates = df["date"].values
-    target = df[["Class_1d", "Class_1w", "Class_1m", "Class_6m",
-                  "Class_1d_down", "Class_1w_down", "Class_1m_down", "Class_6m_down"]].values if for_training else None
+    target = df[[
+        *[f"Class_{h}" for h in HORIZONS],
+        *[f"Class_{h}_down" for h in HORIZONS],
+    ]].values if for_training else None
 
     X, y, y_dates = [], [], []
     window = CONFIG["WINDOW_SIZE"]
@@ -189,19 +225,25 @@ def process_instrument(csv_path: Path, for_training=True):
     )
 
 
-def process_instrument_for_inference(csv_path: Path):
-    """Process instrument data for daily inference predictions"""
+def process_instrument_for_inference(csv_path: Path, ctx: PipelineContext = None):
+    """Process instrument data for daily inference predictions."""
+    if ctx is None:
+        _sc = _ctx.scaler if _ctx.feature_cols else scaler
+        _fc = _ctx.feature_cols or feature_cols
+    else:
+        _sc = ctx.scaler
+        _fc = ctx.feature_cols
+
     df = pd.read_csv(csv_path, parse_dates=["date"]).sort_values("date").reset_index(drop=True)
     df = add_features(df)
     if df.empty:
         return np.array([]), np.array([]), df, np.array([])
 
-    global feature_cols
-    for col in feature_cols:
+    for col in _fc:
         if col not in df.columns:
             df[col] = 0.0
 
-    features_scaled = scaler.transform(df[feature_cols].values)
+    features_scaled = _sc.transform(df[_fc].values)
     dates = df["date"].values
     target = df[["close"]].values
 
@@ -221,12 +263,12 @@ def process_instrument_for_inference(csv_path: Path):
     )
 
 
-def cache_preprocessed(csv_path: Path, train_cutoff, train_val_cutoff):
+def cache_preprocessed(csv_path: Path, train_cutoff, train_val_cutoff, ctx: PipelineContext = None):
     """Cache preprocessed data split by train/val/test"""
     symbol_name = csv_path.stem
     logger.info(f"Rebuilding cache for: {symbol_name}")
 
-    X, y, _, y_dates = process_instrument(csv_path, for_training=True)
+    X, y, _, y_dates = process_instrument(csv_path, for_training=True, ctx=ctx)
     if X.size == 0:
         for split in ["train", "val", "test"]:
             np.save(CONFIG["CACHE_DIR"] / f"{symbol_name}_X_{split}.npy", np.array([]))
@@ -346,23 +388,7 @@ def make_forecast(model, X, dates, closes, horizons, horizon_days):
     return forecasting_df
 
 
-class Attention(Layer):
-    """Attention layer for model interpretation"""
-    def __init__(self):
-        super(Attention, self).__init__()
-
-    def build(self, input_shape):
-        self.W = self.add_weight(name="att_weight", shape=(input_shape[-1], 1),
-                                 initializer="normal")
-        self.b = self.add_weight(name="att_bias", shape=(input_shape[1], 1),
-                                 initializer="zeros")        
-        super().build(input_shape)
-
-    def call(self, x):
-        e = tf.keras.backend.tanh(tf.keras.backend.dot(x, self.W) + self.b)
-        a = tf.keras.backend.softmax(e, axis=1)  # attention weights
-        output = x * a
-        return tf.keras.backend.sum(output, axis=1)
+# Attention class is imported from src.models.layers (single definition)
 
 
 def feature_importance(model, X_val, y_val, feature_names):
@@ -406,7 +432,7 @@ def main():
     
     if not all_csvs:
         logger.error(f"No CSV files found in {CONFIG['DATA_DIR']} subdirectories (forex/, indices/, commodities/, crypto/)")
-        return
+        sys.exit(1)
     
     # ========================================================================
     # STEP 1: Determine global cutoffs & fit scaler
@@ -414,11 +440,12 @@ def main():
     logger.info("Step 1: Determining global cutoffs and fitting scaler...")
     
     global global_min_date, global_max_date, feature_cols, scaler
-    global global_thresholds_up, global_thresholds_down
+    global global_thresholds_up, global_thresholds_down, _ctx
     
     global_min_date, global_max_date = None, None
     scaler_inputs = []
     feature_cols = None
+    scaler = StandardScaler()
 
     for csv_path in all_csvs:
         df_tmp = pd.read_csv(csv_path, parse_dates=["date"])
@@ -455,7 +482,7 @@ def main():
     # ========================================================================
     logger.info("Step 1b: Computing target thresholds from training data only...")
     
-    all_targets = {f"Target_{h}": [] for h in ["1d", "1w", "1m", "6m"]}
+    all_targets = {f"Target_{h}": [] for h in HORIZONS}
     for csv_path in all_csvs:
         df = pd.read_csv(csv_path, parse_dates=["date"]).sort_values("date").dropna()
         df = add_features(df)
@@ -464,12 +491,12 @@ def main():
         train_rows = df[df["date"] < train_cutoff]
         if len(train_rows) == 0:
             continue
-        for h in ["1d", "1w", "1m", "6m"]:
+        for h in HORIZONS:
             all_targets[f"Target_{h}"].append(train_rows[f"Target_{h}"].values)
     
     global_thresholds_up = {}
     global_thresholds_down = {}
-    for h in ["1d", "1w", "1m", "6m"]:
+    for h in HORIZONS:
         vals = np.concatenate(all_targets[f"Target_{h}"])
         mu = np.nanmean(vals)
         sig = np.nanstd(vals)
@@ -478,6 +505,14 @@ def main():
         logger.info(f"  {h}: up_thresh={global_thresholds_up[h]:.6f}, down_thresh={global_thresholds_down[h]:.6f} (mu={mu:.6f}, sig={sig:.6f})")
     
     logger.info("Thresholds computed from training data only (no leakage)")
+
+    # Populate module-level PipelineContext for use by process_instrument
+    _ctx = PipelineContext(
+        scaler=scaler,
+        feature_cols=feature_cols,
+        thresholds_up=global_thresholds_up,
+        thresholds_down=global_thresholds_down,
+    )
 
     # ========================================================================
     # STEP 2: Cache preprocessed data
@@ -511,34 +546,10 @@ def main():
     logger.info("Step 4: Building model...")
     
     n_features = len(feature_cols)
-    model = Sequential([
-        # Temporal convolution to capture local patterns
-        Conv1D(64, kernel_size=3, activation="relu", padding="same",
-               input_shape=(CONFIG["WINDOW_SIZE"] + 1, n_features)),
-        BatchNormalization(),
-        MCDropout(0.3),
-        
-        # Second conv layer for higher-level patterns
-        Conv1D(32, kernel_size=3, activation="relu", padding="same"),
-        BatchNormalization(),
-        MCDropout(0.2),
-        
-        # Stacked LSTMs for long-range dependencies
-        LSTM(128, return_sequences=True),
-        MCDropout(0.3),
-        LSTM(64, return_sequences=False),
-        MCDropout(0.3),
-        
-        # Dense head
-        Dense(64, activation="relu"),
-        BatchNormalization(),
-        MCDropout(0.2),
-        Dense(32, activation="relu"),
-        Dense(8, activation="sigmoid")  # 4 upside + 4 downside horizon predictions
-    ])
+    model = build_model(n_features, CONFIG["WINDOW_SIZE"])
 
     early_stop = EarlyStopping(
-        patience=30,
+        patience=CONFIG["EARLY_STOP_PATIENCE"],
         monitor="val_loss",
         restore_best_weights=True,
         mode="min",
@@ -547,7 +558,7 @@ def main():
     reduce_lr = ReduceLROnPlateau(
         monitor="val_loss",
         factor=0.5,
-        patience=10,
+        patience=CONFIG["REDUCE_LR_PATIENCE"],
         min_lr=1e-6,
         verbose=1,
     )
@@ -576,14 +587,14 @@ def main():
 
     logger.info("Training model...")
     history = model.fit(train_gen, validation_data=val_gen, callbacks=[early_stop, reduce_lr], 
-                        epochs=500, class_weight=cw, verbose=1)
+                        epochs=CONFIG["MAX_EPOCHS"], class_weight=cw, verbose=1)
 
     # ========================================================================
     # STEP 4b: Model quality gate — refuse to deploy a bad model
     # ========================================================================
     logger.info("Step 4b: Checking model quality before deployment...")
     
-    MIN_VAL_AUC = 0.55  # Minimum required val AUC (above random = 0.5)
+    MIN_VAL_AUC = CONFIG["MIN_VAL_AUC"]
     final_val_auc = history.history.get("val_auc", [0])[-1]
     final_val_loss = history.history.get("val_loss", [float('inf')])[-1]
     logger.info(f"Final val AUC: {final_val_auc:.4f}, val loss: {final_val_loss:.4f}")
@@ -594,7 +605,7 @@ def main():
             f"Model is near-random and will NOT be saved. "
             f"Check data quality, class balance, and feature engineering."
         )
-        return
+        sys.exit(1)
     
     logger.info(f"Model quality gate PASSED (val AUC {final_val_auc:.4f} >= {MIN_VAL_AUC})")
 
@@ -606,9 +617,8 @@ def main():
     model.save(CONFIG["MODEL_DIR"] / "lstm_model.keras")
     logger.info(f"Saved model to {CONFIG['MODEL_DIR'] / 'lstm_model.keras'}")
     
-    with open(CONFIG["MODEL_DIR"] / "scaler.pkl", "wb") as f:
-        pickle.dump(scaler, f)
-    logger.info(f"Saved scaler to {CONFIG['MODEL_DIR'] / 'scaler.pkl'}")
+    joblib.dump(scaler, CONFIG["MODEL_DIR"] / "scaler.joblib")
+    logger.info(f"Saved scaler to {CONFIG['MODEL_DIR'] / 'scaler.joblib'}")
     
     with open(CONFIG["MODEL_DIR"] / "feature_cols.json", "w") as f:
         json.dump(feature_cols, f)
@@ -700,7 +710,7 @@ def main():
     for csv_path in all_csvs:
         symbol_name = Path(csv_path).stem
 
-        X_all, closes, pred_dates, df = process_instrument_for_inference(Path(csv_path))
+        X_all, closes, pred_dates, df = process_instrument_for_inference(Path(csv_path), ctx=_ctx)
 
         if X_all.size == 0:
             continue

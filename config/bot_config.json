@@ -15,6 +15,21 @@
 
     "MAX_CONCURRENT_POSITIONS": 3,
     "RISK_PER_TRADE_PCT": 1.0,
+
+    "SLOTS_PER_TYPE": {
+        "Index": 2,
+        "Forex": 3,
+        "Crypto": 1,
+        "Commodity": 2
+    },
+    "RISK_PER_TYPE": {
+        "Index": 1.0,
+        "Forex": 0.75,
+        "Crypto": 0.5,
+        "Commodity": 1.0
+    },
+    "GLOBAL_MAX_SLOTS": 5,
+    "GLOBAL_MAX_RISK_PCT": 5.0,
     "DEFAULT_LOT_SIZE": 0.01,
     "MAX_LOT_SIZE": 1.0,
     "ATR_SL_MULTIPLIER": 2.0,

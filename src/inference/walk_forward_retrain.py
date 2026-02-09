@@ -16,7 +16,6 @@ import os
 import sys
 import json
 import time
-import pickle
 import shutil
 import hashlib
 import logging
@@ -25,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import joblib
 
 # ---------------------------------------------------------------------------
 # Ensure project root on path
@@ -35,18 +35,21 @@ sys.path.insert(0, str(PROJECT_ROOT))
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import tensorflow as tf
-from tensorflow.keras.models import load_model, Sequential
-from tensorflow.keras.layers import Conv1D, LSTM, Dense, Dropout, BatchNormalization
+from tensorflow.keras.models import load_model
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.metrics import AUC
 from sklearn.preprocessing import StandardScaler
 
+from src.models.layers import MCDropout
+from src.models.lstm import build_model
+from src.models.context import PipelineContext
+from src.utils.constants import HORIZONS, EXCLUDED_COLS
 from src.inference.run_forecast import (
-    MCDropout,
     CONFIG,
     add_features,
     InstrumentDataGenerator,
     mc_dropout_predict,
+    cache_preprocessed,
 )
 
 logger = logging.getLogger(__name__)
@@ -193,8 +196,7 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
     # ------------------------------------------------------------------
     # 3. Compute thresholds from training data
     # ------------------------------------------------------------------
-    import src.inference.run_forecast as rf
-    all_targets = {f"Target_{h}": [] for h in ["1d", "1w", "1m", "6m"]}
+    all_targets = {f"Target_{h}": [] for h in HORIZONS}
     for csv_path in all_csvs:
         df = pd.read_csv(csv_path, parse_dates=["date"]).sort_values("date").dropna()
         df = add_features(df)
@@ -203,25 +205,23 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
         train_rows = df[df["date"] < train_cutoff]
         if len(train_rows) == 0:
             continue
-        for h in ["1d", "1w", "1m", "6m"]:
+        for h in HORIZONS:
             all_targets[f"Target_{h}"].append(train_rows[f"Target_{h}"].values)
 
     thresholds_up, thresholds_down = {}, {}
-    for h in ["1d", "1w", "1m", "6m"]:
+    for h in HORIZONS:
         vals = np.concatenate(all_targets[f"Target_{h}"])
         mu, sig = np.nanmean(vals), np.nanstd(vals)
         thresholds_up[h] = mu + 2 * sig
         thresholds_down[h] = mu - 2 * sig
 
-    # Temporarily override globals in run_forecast for cache_preprocessed
-    old_scaler = rf.scaler
-    old_fc = rf.feature_cols
-    old_tu = rf.global_thresholds_up
-    old_td = rf.global_thresholds_down
-    rf.scaler = new_scaler
-    rf.feature_cols = feature_cols
-    rf.global_thresholds_up = thresholds_up
-    rf.global_thresholds_down = thresholds_down
+    # Build a PipelineContext for this retrain run (no global mutation)
+    retrain_ctx = PipelineContext(
+        scaler=new_scaler,
+        feature_cols=feature_cols,
+        thresholds_up=thresholds_up,
+        thresholds_down=thresholds_down,
+    )
 
     # ------------------------------------------------------------------
     # 4. Cache preprocessed data
@@ -234,9 +234,8 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
     old_cache = CONFIG["CACHE_DIR"]
     # Use a temp cache dir for retraining
     CONFIG["CACHE_DIR"] = cache_bak
-    from src.inference.run_forecast import cache_preprocessed
     for csv_path in all_csvs:
-        cache_preprocessed(Path(csv_path), train_cutoff, train_val_cutoff)
+        cache_preprocessed(Path(csv_path), train_cutoff, train_val_cutoff, ctx=retrain_ctx)
     CONFIG["CACHE_DIR"] = old_cache  # restore
 
     # ------------------------------------------------------------------
@@ -251,35 +250,18 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
 
     logger.info(f"Train batches: {len(train_gen)}, Val batches: {len(val_gen)}")
 
-    new_model = Sequential([
-        Conv1D(64, kernel_size=3, activation="relu", padding="same",
-               input_shape=(CONFIG["WINDOW_SIZE"] + 1, n_features)),
-        BatchNormalization(),
-        MCDropout(0.3),
-        Conv1D(32, kernel_size=3, activation="relu", padding="same"),
-        BatchNormalization(),
-        MCDropout(0.2),
-        LSTM(128, return_sequences=True),
-        MCDropout(0.3),
-        LSTM(64, return_sequences=False),
-        MCDropout(0.3),
-        Dense(64, activation="relu"),
-        BatchNormalization(),
-        MCDropout(0.2),
-        Dense(32, activation="relu"),
-        Dense(8, activation="sigmoid"),
-    ])
+    new_model = build_model(n_features, CONFIG["WINDOW_SIZE"])
 
     new_model.compile(optimizer="adam", loss="binary_crossentropy", metrics=[AUC(name="auc")])
 
-    early_stop = EarlyStopping(patience=30, monitor="val_loss", restore_best_weights=True, mode="min")
-    reduce_lr = ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=10, min_lr=1e-6, verbose=1)
+    early_stop = EarlyStopping(patience=CONFIG.get("EARLY_STOP_PATIENCE", 30), monitor="val_loss", restore_best_weights=True, mode="min")
+    reduce_lr = ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=CONFIG.get("REDUCE_LR_PATIENCE", 10), min_lr=1e-6, verbose=1)
 
     new_model.fit(
         train_gen,
         validation_data=val_gen,
         callbacks=[early_stop, reduce_lr],
-        epochs=500,
+        epochs=CONFIG.get("MAX_EPOCHS", 500),
         verbose=1,
     )
 
@@ -322,15 +304,14 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
         archive_dir = CONFIG["MODEL_DIR"] / "archive"
         archive_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        for artifact in ["lstm_model.keras", "scaler.pkl", "feature_cols.json", "feature_hash.txt", "thresholds.json"]:
+        for artifact in ["lstm_model.keras", "scaler.joblib", "scaler.pkl", "feature_cols.json", "feature_hash.txt", "thresholds.json"]:
             src = CONFIG["MODEL_DIR"] / artifact
             if src.exists():
                 shutil.copy2(src, archive_dir / f"{ts}_{artifact}")
 
         # Save new artifacts
         new_model.save(model_path)
-        with open(CONFIG["MODEL_DIR"] / "scaler.pkl", "wb") as f:
-            pickle.dump(new_scaler, f)
+        joblib.dump(new_scaler, CONFIG["MODEL_DIR"] / "scaler.joblib")
         with open(CONFIG["MODEL_DIR"] / "feature_cols.json", "w") as f:
             json.dump(feature_cols, f)
         feature_hash = hashlib.sha256(json.dumps(sorted(feature_cols)).encode()).hexdigest()[:16]
@@ -340,12 +321,6 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
             json.dump({"thresholds_up": thresholds_up, "thresholds_down": thresholds_down}, f, indent=2)
 
         logger.info(f"New model deployed. Feature hash: {feature_hash}")
-
-    # Restore run_forecast globals
-    rf.scaler = old_scaler
-    rf.feature_cols = old_fc
-    rf.global_thresholds_up = old_tu
-    rf.global_thresholds_down = old_td
 
     # Clean up temp cache
     if cache_bak.exists():

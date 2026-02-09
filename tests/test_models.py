@@ -48,17 +48,16 @@ def test_place_order_request_invalid_volume():
 
 
 def test_place_order_request_comment_truncation():
-    """Test comment length validation."""
+    """Test comment length validation rejects strings exceeding max_length."""
+    import pydantic
     long_comment = "x" * 100
-    order = PlaceOrderRequest(
-        symbol="EURUSD",
-        side=OrderSide.BUY,
-        volume=0.01,
-        comment=long_comment
-    )
-    # Comment should be validated to max 31 chars at model level
-    # (actual truncation happens in MT5 client)
-    assert len(order.comment) <= 100  # Pydantic allows, MT5 client truncates
+    with pytest.raises(pydantic.ValidationError):
+        PlaceOrderRequest(
+            symbol="EURUSD",
+            side=OrderSide.BUY,
+            volume=0.01,
+            comment=long_comment
+        )
 
 
 def test_modify_order_request_valid():

@@ -104,9 +104,11 @@ def add_cross_asset_features(df, cross_assets):
     Uses forward-fill for date mismatches (holidays, weekends differ by market)."""
     for label, ref_df in cross_assets.items():
         df = pd.merge(df, ref_df, on="date", how="left")
-    # Forward-fill then back-fill cross-asset columns (different trading calendars)
+    # Forward-fill cross-asset columns (different trading calendars).
+    # NOTE: We use ffill().fillna(0) instead of ffill().bfill() to prevent
+    # backward-fill from leaking future data into earlier rows.
     xa_cols = [c for c in df.columns if c.startswith("XA_")]
-    df[xa_cols] = df[xa_cols].ffill().bfill().fillna(0)
+    df[xa_cols] = df[xa_cols].ffill().fillna(0)
     return df
 
 

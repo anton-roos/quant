@@ -16,34 +16,17 @@ Usage:
 import requests
 import pandas as pd
 import os
-import re
 from datetime import datetime, timedelta
 import json
 from typing import List, Optional, Dict
 from pathlib import Path
 
+from src.utils.constants import sanitize_filename
+
 
 def _sanitize_filename(symbol: str) -> str:
-    """
-    Convert an MT5 symbol name to a safe, clean filename.
-    
-    Examples:
-        "EURUSD"              -> "EURUSD"
-        "Bitcoin (BTCUSD)"    -> "BTCUSD"
-        "Brent Crude Oil"     -> "Brent_Crude_Oil"
-        "S&P 500"             -> "SP500"
-        "DJ Euro Stoxx 50"    -> "DJ_Euro_Stoxx_50"
-    """
-    # If the name contains a parenthesized ticker like "Bitcoin (BTCUSD)", extract it
-    match = re.search(r'\(([A-Z0-9]+)\)', symbol)
-    if match:
-        return match.group(1)
-    
-    # Otherwise sanitize: replace & with nothing, spaces with _, strip non-alphanumeric
-    name = symbol.replace("&", "").strip()
-    name = re.sub(r'\s+', '_', name)
-    name = re.sub(r'[^A-Za-z0-9_]', '', name)
-    return name
+    """Backward-compatible alias — delegates to ``src.utils.constants.sanitize_filename``."""
+    return sanitize_filename(symbol)
 
 class MT5BridgeDownloader:
     """Download historical data from MT5 Bridge API."""

@@ -127,6 +127,35 @@ def validate_config(config: Dict) -> List[str]:
                 if not isinstance(v, (int, float)) or v < 0:
                     errors.append(f"HORIZON_WEIGHTS[{k}]: expected positive number, got {v!r}")
 
+    # Validate per-instrument-type slot allocation
+    slots = config.get("SLOTS_PER_TYPE")
+    if slots is not None:
+        if not isinstance(slots, dict):
+            errors.append(f"SLOTS_PER_TYPE: expected dict, got {type(slots).__name__}")
+        else:
+            for k, v in slots.items():
+                if not isinstance(v, int) or v < 0:
+                    errors.append(f"SLOTS_PER_TYPE[{k}]: expected non-negative int, got {v!r}")
+
+    risk_per_type = config.get("RISK_PER_TYPE")
+    if risk_per_type is not None:
+        if not isinstance(risk_per_type, dict):
+            errors.append(f"RISK_PER_TYPE: expected dict, got {type(risk_per_type).__name__}")
+        else:
+            for k, v in risk_per_type.items():
+                if not isinstance(v, (int, float)) or v <= 0 or v > 5.0:
+                    errors.append(f"RISK_PER_TYPE[{k}]: expected 0 < value <= 5.0, got {v!r}")
+
+    gms = config.get("GLOBAL_MAX_SLOTS")
+    if gms is not None:
+        if not isinstance(gms, int) or gms < 1 or gms > 20:
+            errors.append(f"GLOBAL_MAX_SLOTS: expected int 1-20, got {gms!r}")
+
+    gmr = config.get("GLOBAL_MAX_RISK_PCT")
+    if gmr is not None:
+        if not isinstance(gmr, (int, float)) or gmr <= 0 or gmr > 25.0:
+            errors.append(f"GLOBAL_MAX_RISK_PCT: expected 0 < value <= 25.0, got {gmr!r}")
+
     return errors
 
 

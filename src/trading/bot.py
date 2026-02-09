@@ -13,7 +13,6 @@ import os
 import sys
 import json
 import time
-import pickle
 import logging
 import signal
 import traceback
@@ -23,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import joblib
 
 # ---------------------------------------------------------------------------
 # Ensure project root is on the path
@@ -37,14 +37,15 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # Suppress TF info logs
 
 import tensorflow as tf
 from tensorflow.keras.models import load_model
-from tensorflow.keras.layers import Dropout
 
+from src.models.layers import MCDropout
+from src.utils.constants import sanitize_filename, CATEGORY_TYPE_TO_FOLDER
 from src.trading.mt5_client import MT5Client
 from src.trading.trade_journal import TradeJournal
 from src.trading.notifications import Notifier
 from src.trading.config_validator import validate_config_or_die
+from src.trading.slot_manager import SlotManager
 from src.data.processor import process_file, invalidate_cross_asset_cache
-from src.data.features.mt5_bridge_downloader import _sanitize_filename
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -64,14 +65,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("trading_bot")
 
-# ---------------------------------------------------------------------------
-# MCDropout (must match training definition for model loading)
-# ---------------------------------------------------------------------------
+# MCDropout imported from src.models.layers (single definition)
+# sanitize_filename imported from src.utils.constants
 
-class MCDropout(Dropout):
-    """MC Dropout – keeps dropout active during inference."""
-    def call(self, inputs, training=None):
-        return super().call(inputs, training=True)
+# Backward-compatible alias for code that still uses _sanitize_filename
+_sanitize_filename = sanitize_filename
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +84,7 @@ DEFAULT_CONFIG = {
 
     # Model artifacts (relative to project root)
     "MODEL_PATH": "outputs/models/lstm_model.keras",
-    "SCALER_PATH": "outputs/models/scaler.pkl",
+    "SCALER_PATH": "outputs/models/scaler.joblib",
     "FEATURES_PATH": "outputs/models/feature_cols.json",
     "SYMBOLS_PATH": "config/symbols.json",
 
@@ -101,13 +99,19 @@ DEFAULT_CONFIG = {
     "WINDOW_SIZE": 90,
 
     # Risk management
-    "MAX_CONCURRENT_POSITIONS": 3,
-    "RISK_PER_TRADE_PCT": 1.0,         # % of equity risked per trade
+    "MAX_CONCURRENT_POSITIONS": 3,       # Legacy: global cap (now use GLOBAL_MAX_SLOTS)
+    "RISK_PER_TRADE_PCT": 1.0,         # Default % of equity risked per trade
     "DEFAULT_LOT_SIZE": 0.01,          # Fallback if sizing calc fails
     "MAX_LOT_SIZE": 1.0,               # Hard cap
     "ATR_SL_MULTIPLIER": 2.0,          # SL = ATR * multiplier
     "ATR_TP_MULTIPLIER": 3.0,          # TP = ATR * multiplier (1.5× reward/risk)
     "MAX_DRAWDOWN_PCT": 15.0,          # Halt trading if drawdown exceeds this
+
+    # Per-instrument-type slot allocation
+    "SLOTS_PER_TYPE": {"Index": 2, "Forex": 3, "Crypto": 1, "Commodity": 2},
+    "RISK_PER_TYPE": {"Index": 1.0, "Forex": 0.75, "Crypto": 0.5, "Commodity": 1.0},
+    "GLOBAL_MAX_SLOTS": 5,              # Max simultaneous trades across all types
+    "GLOBAL_MAX_RISK_PCT": 5.0,         # Max total portfolio risk %
 
     # Correlation filter
     "CORRELATION_THRESHOLD": 0.7,       # Reject if corr > this with an open position
@@ -184,6 +188,9 @@ class TradingBot:
         self._cycle_cache: Dict[str, pd.DataFrame] = {}  # Per-cycle CSV cache
         self.last_refresh_date: Optional[str] = None
 
+        # Per-instrument-type slot manager
+        self.slot_manager = SlotManager.from_config(self.config)
+
         # Load bridge client
         self.mt5 = MT5Client(
             host=self.config["MT5_HOST"],
@@ -237,8 +244,19 @@ class TradingBot:
         self.model = load_model(model_path, custom_objects={"MCDropout": MCDropout})
         logger.info(f"Model loaded: {model_path}")
 
-        with open(scaler_path, "rb") as f:
-            self.scaler = pickle.load(f)
+        # Try joblib first, fall back to pickle for legacy scaler.pkl files
+        if scaler_path.suffix == ".joblib" or scaler_path.exists():
+            try:
+                self.scaler = joblib.load(scaler_path)
+            except Exception:
+                # Fall back to pickle for old artifacts
+                import pickle
+                pkl_path = scaler_path.with_suffix(".pkl")
+                if pkl_path.exists():
+                    with open(pkl_path, "rb") as f:
+                        self.scaler = pickle.load(f)
+                else:
+                    raise
         logger.info(f"Scaler loaded: {scaler_path}")
 
         with open(features_path, "r") as f:
@@ -272,7 +290,7 @@ class TradingBot:
         # Build mapping: sanitized filename stem -> MT5 symbol name
         for sym in self.symbols:
             mt5_name = sym["name"]
-            safe_name = _sanitize_filename(mt5_name)
+            safe_name = sanitize_filename(mt5_name)
             self.symbol_name_map[safe_name] = mt5_name
 
         logger.info(f"Loaded {len(self.symbols)} symbols")
@@ -325,11 +343,11 @@ class TradingBot:
         raw_base = PROJECT_ROOT / self.config["RAW_DIR"]
         processed_base = PROJECT_ROOT / self.config["PROCESSED_DIR"]
 
-        category_map = {"Forex": "forex", "Index": "indices", "Commodity": "commodities", "Crypto": "crypto"}
+        category_map = CATEGORY_TYPE_TO_FOLDER
 
         for sym in self.symbols:
             mt5_name = sym["name"]
-            safe_name = _sanitize_filename(mt5_name)
+            safe_name = sanitize_filename(mt5_name)
             cat_folder = category_map.get(sym.get("type", ""), "other")
             raw_dir = raw_base / cat_folder
             raw_dir.mkdir(parents=True, exist_ok=True)
@@ -460,8 +478,8 @@ class TradingBot:
 
         for sym in self.symbols:
             mt5_name = sym["name"]
-            safe_name = _sanitize_filename(mt5_name)
-            cat_map = {"Forex": "forex", "Index": "indices", "Commodity": "commodities", "Crypto": "crypto"}
+            safe_name = sanitize_filename(mt5_name)
+            cat_map = CATEGORY_TYPE_TO_FOLDER
             cat_folder = cat_map.get(sym.get("type", ""), "other")
             csv_path = processed_base / cat_folder / f"{safe_name}_daily_processed.csv"
 
@@ -706,7 +724,7 @@ class TradingBot:
     # ------------------------------------------------------------------
     def _load_close_series(self, mt5_name: str) -> Optional[pd.Series]:
         """Load the daily close price series for a symbol from processed data (cached)."""
-        safe_name = _sanitize_filename(mt5_name)
+        safe_name = sanitize_filename(mt5_name)
         processed_base = PROJECT_ROOT / self.config["PROCESSED_DIR"]
 
         # Find the symbol's type from our symbol list
@@ -714,8 +732,7 @@ class TradingBot:
         if sym_entry is None:
             return None
 
-        cat_map = {"Forex": "forex", "Index": "indices", "Commodity": "commodities", "Crypto": "crypto"}
-        cat_folder = cat_map.get(sym_entry.get("type", ""), "other")
+        cat_folder = CATEGORY_TYPE_TO_FOLDER.get(sym_entry.get("type", ""), "other")
         csv_path = processed_base / cat_folder / f"{safe_name}_daily_processed.csv"
 
         df = self._get_cached_df(csv_path)
@@ -882,15 +899,14 @@ class TradingBot:
 
     def _get_current_atr(self, mt5_name: str) -> float:
         """Get the latest ATR_14 value for a symbol from processed data (cached)."""
-        safe_name = _sanitize_filename(mt5_name)
+        safe_name = sanitize_filename(mt5_name)
         processed_base = PROJECT_ROOT / self.config["PROCESSED_DIR"]
 
         sym_entry = next((s for s in self.symbols if s["name"] == mt5_name), None)
         if sym_entry is None:
             return 0.0
 
-        cat_map = {"Forex": "forex", "Index": "indices", "Commodity": "commodities", "Crypto": "crypto"}
-        cat_folder = cat_map.get(sym_entry.get("type", ""), "other")
+        cat_folder = CATEGORY_TYPE_TO_FOLDER.get(sym_entry.get("type", ""), "other")
         csv_path = processed_base / cat_folder / f"{safe_name}_daily_processed.csv"
 
         df = self._get_cached_df(csv_path)
@@ -1010,20 +1026,24 @@ class TradingBot:
         # 2b. Manage trailing stops on open positions
         self._manage_trailing_stops()
 
-        # 3. Count current bot positions
+        # 3. Count current bot positions & compute per-type slot usage
         try:
             open_positions = self.mt5.bot_positions()
             n_open = len(open_positions)
             open_symbols = {p["symbol"] for p in open_positions}
+            open_by_type = SlotManager.count_open_by_type(open_positions, self.symbols)
             logger.info(f"Open bot positions: {n_open} {list(open_symbols)}")
+            self.slot_manager.log_slot_status(open_by_type)
         except Exception as e:
             logger.error(f"Failed to fetch positions: {e}")
             return
 
-        max_pos = self.config["MAX_CONCURRENT_POSITIONS"]
-        slots_available = max_pos - n_open
-        if slots_available <= 0:
-            logger.info(f"Max positions ({max_pos}) reached — skipping signal generation")
+        global_remaining = self.slot_manager.global_slots_remaining(open_by_type)
+        if global_remaining <= 0:
+            logger.info(
+                f"Global slot cap ({self.slot_manager.global_max_slots}) reached "
+                f"— skipping signal generation"
+            )
             return
 
         # 4. Account snapshot + equity journal
@@ -1066,7 +1086,10 @@ class TradingBot:
         # 6. Execute best candidates (up to available slots)
         trades_opened = 0
         for candidate in candidates:
-            if trades_opened >= slots_available:
+            # Re-check global slots (may have been consumed this cycle)
+            open_by_type = SlotManager.count_open_by_type(open_positions, self.symbols)
+            if self.slot_manager.global_slots_remaining(open_by_type) <= 0:
+                logger.info("Global slot cap reached — stopping candidate evaluation")
                 break
 
             mt5_name = candidate["mt5_name"]
@@ -1080,18 +1103,13 @@ class TradingBot:
             if self._is_too_correlated(mt5_name, candidate["side"], open_positions):
                 continue
 
-            # Asset-class concentration filter: max 2 positions per asset class
-            MAX_PER_ASSET_CLASS = 2
+            # Per-instrument-type slot check
             candidate_type = candidate.get("type", "Unknown")
-            open_types = [
-                next((s.get("type", "") for s in self.symbols if s["name"] == p["symbol"]), "")
-                for p in open_positions
-            ]
-            same_class_count = sum(1 for t in open_types if t == candidate_type)
-            if same_class_count >= MAX_PER_ASSET_CLASS:
+            type_remaining = self.slot_manager.type_slots_remaining(candidate_type, open_by_type)
+            if type_remaining <= 0:
                 logger.info(
-                    f"  Skipping {mt5_name} — already {same_class_count} positions "
-                    f"in {candidate_type} (max {MAX_PER_ASSET_CLASS})"
+                    f"  Skipping {mt5_name} — {candidate_type} slots full "
+                    f"({self.slot_manager.slots_per_type.get(candidate_type, 0)} max)"
                 )
                 continue
 
@@ -1149,6 +1167,8 @@ class TradingBot:
                 if result.get("accepted"):
                     trades_opened += 1
                     open_symbols.add(mt5_name.upper())
+                    # Track the new position for accurate per-type slot counting
+                    open_positions.append({"symbol": mt5_name})
 
                     fill_price = result.get("price", live_price)
                     ticket = result.get("ticket", 0)

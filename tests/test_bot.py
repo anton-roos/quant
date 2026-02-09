@@ -28,7 +28,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 def _make_processed_csv(tmp_dir: Path, symbol: str = "EURUSD", category: str = "forex", rows: int = 200):
     """Create a minimal processed CSV with required columns."""
-    dates = pd.date_range(end="2026-02-08", periods=rows, freq="B")
+    dates = pd.bdate_range(end="2026-02-06", periods=rows)
     close = 1.08 + np.random.randn(rows).cumsum() * 0.001
     df = pd.DataFrame({
         "date": dates,
