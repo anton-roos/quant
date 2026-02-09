@@ -63,6 +63,8 @@
     "NOTIFY_ON_DRAWDOWN": true,
     "NOTIFY_ON_ERROR": true,
 
+    "BRIDGE_LOG_DIR": "outputs/bridge_logs",
+
     "STATE_FILE": "outputs/bot_state.json",
 
     "CHECK_INTERVAL_SECONDS": 300,

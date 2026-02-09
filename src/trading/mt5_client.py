@@ -85,14 +85,11 @@ def with_retries(max_retries: int = 3, base_delay: float = 1.0, max_delay: float
 class MT5Client:
     """Thin REST wrapper around the MT5 Bridge at localhost:8787."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 8787, magic: int = 24001,
-                 api_key: Optional[str] = None):
+    def __init__(self, host: str = "127.0.0.1", port: int = 8787, magic: int = 24001):
         self.base_url = f"http://{host}:{port}"
         self.magic = magic
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
-        if api_key:
-            self.session.headers.update({"X-API-Key": api_key})
 
     # ------------------------------------------------------------------
     # Connectivity

@@ -1,13 +1,13 @@
 import datetime
+import json
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
-from pydantic import field_validator
-from pydantic_settings import BaseSettings
+from pathlib import Path
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 import numpy as np
 import asyncio
-import secrets
 
 from .models import (
     PlaceOrderRequest, ModifyOrderRequest, CloseOrderRequest, CancelOrderRequest,
@@ -27,27 +27,39 @@ from .indicators import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Shared config from bot_config.json  (non-secret, committed to repo)
+# Secrets come from .env              (not committed)
+# Environment variables override both.
+# ---------------------------------------------------------------------------
+_BRIDGE_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _BRIDGE_DIR.parent.parent
+
+
+def _load_bot_config() -> dict:
+    """Load shared settings from config/bot_config.json."""
+    cfg_path = _PROJECT_ROOT / "config" / "bot_config.json"
+    if cfg_path.exists():
+        with open(cfg_path) as f:
+            return json.load(f)
+    return {}
+
+
+_bot_cfg = _load_bot_config()
+
+
 class Settings(BaseSettings):
-    """Application settings from environment variables."""
-    bridge_host: str = "127.0.0.1"
-    bridge_port: int = 8787
-    log_dir: str = "./logs"
-    
-    # API key for authentication (set via BRIDGE_API_KEY env var)
-    # If empty/None, authentication is disabled (local dev mode)
-    bridge_api_key: Optional[str] = None
-    
-    mt5_login: Optional[int] = None
-    mt5_password: Optional[str] = None
-    mt5_server: Optional[str] = None
-    
-    @field_validator('mt5_login', 'mt5_password', 'mt5_server', 'bridge_api_key', mode='before')
-    @classmethod
-    def empty_str_to_none(cls, v):
-        """Convert empty strings to None."""
-        if v == '' or v is None:
-            return None
-        return v
+    """Bridge settings — defaults from bot_config.json, secrets from .env."""
+
+    model_config = SettingsConfigDict(
+        env_file=_BRIDGE_DIR / ".env",
+        env_file_encoding="utf-8",
+    )
+
+    # Shared with bot (from bot_config.json)
+    bridge_host: str = _bot_cfg.get("MT5_HOST", "127.0.0.1")
+    bridge_port: int = _bot_cfg.get("MT5_PORT", 8787)
+    log_dir: str = str(_PROJECT_ROOT / _bot_cfg.get("BRIDGE_LOG_DIR", "outputs/bridge_logs"))
 
 
 settings = Settings()
@@ -65,11 +77,7 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     state.logger = setup_logging(settings.log_dir)
     state.logger.info("Starting MT5 Bridge (Pure Bridge Mode - No Risk Management)...")
-    state.mt5_client = MT5Client(
-        login=settings.mt5_login,
-        password=settings.mt5_password,
-        server=settings.mt5_server
-    )
+    state.mt5_client = MT5Client()
     state.jsonl_logger = JSONLLogger(settings.log_dir)
     result = state.mt5_client.initialize()
     if result.success:
@@ -91,25 +99,7 @@ app = FastAPI(
 )
 
 
-# ---------------------------------------------------------------------------
-# API Key Authentication Middleware
-# ---------------------------------------------------------------------------
 
-@app.middleware("http")
-async def authenticate_request(request: Request, call_next):
-    """Verify API key on every request if BRIDGE_API_KEY is configured."""
-    api_key = settings.bridge_api_key
-    if api_key is not None:
-        # Allow health check without auth
-        if request.url.path not in ("/", "/health"):
-            provided_key = request.headers.get("X-API-Key", "")
-            if not secrets.compare_digest(provided_key, api_key):
-                return JSONResponse(
-                    status_code=401,
-                    content={"error": {"code": "UNAUTHORIZED", "message": "Invalid or missing X-API-Key header"}}
-                )
-    response = await call_next(request)
-    return response
 
 
 def error_response(code: ErrorCode, message: str, status_code: int = 400) -> JSONResponse:

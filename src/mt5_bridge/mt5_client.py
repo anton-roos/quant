@@ -18,19 +18,12 @@ class MT5Client:
     All methods return MT5Result objects with structured success/error data.
     """
     
-    def __init__(self, login: Optional[int] = None, password: Optional[str] = None, 
-                 server: Optional[str] = None):
+    def __init__(self):
         """
         Initialize MT5 client.
         
-        Args:
-            login: MT5 account number (optional if terminal already logged in)
-            password: MT5 account password (optional)
-            server: MT5 server name (optional)
+        Relies on the MT5 terminal already being logged in.
         """
-        self.login = login
-        self.password = password
-        self.server = server
         self._initialized = False
         self._timezone = pytz.UTC
     
@@ -49,17 +42,6 @@ class MT5Client:
                     error_code=ErrorCode.MT5_NOT_INITIALIZED,
                     error_message=f"MT5 initialization failed: {error}"
                 )
-            
-            # If credentials provided, attempt login
-            if self.login and self.password and self.server:
-                if not mt5.login(self.login, password=self.password, server=self.server):
-                    error = mt5.last_error()
-                    mt5.shutdown()
-                    return MT5Result(
-                        success=False,
-                        error_code=ErrorCode.MT5_NOT_INITIALIZED,
-                        error_message=f"MT5 login failed: {error}"
-                    )
             
             self._initialized = True
             

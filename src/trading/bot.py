@@ -196,7 +196,6 @@ class TradingBot:
             host=self.config["MT5_HOST"],
             port=self.config["MT5_PORT"],
             magic=self.config["MAGIC"],
-            api_key=self.config.get("BRIDGE_API_KEY"),
         )
 
         # Load model artifacts
