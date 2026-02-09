@@ -173,9 +173,9 @@ def process_instrument(csv_path: Path, for_training=True):
 
     X, y, y_dates = [], [], []
     window = CONFIG["WINDOW_SIZE"]
-    max_horizon = max(horizon_days)  # 126 days, 6 trading months
+    stride = 1  # Use stride=1 to maximize training samples (was max_horizon=126)
 
-    for i in range(window, len(features_scaled), max_horizon):
+    for i in range(window, len(features_scaled), stride):
         X.append(features_scaled[i - window:i + 1])
         if for_training:
             y.append(target[i])
@@ -554,13 +554,54 @@ def main():
 
     model.compile(optimizer="adam", loss="binary_crossentropy", metrics=[AUC(name="auc")])
     
+    # Compute class weights to handle severe imbalance (~2.3% positive rate)
+    # Approximate from the 2-sigma threshold: positive rate ~2.3%, negative ~97.7%
+    logger.info("Computing class weights for imbalanced targets...")
+    try:
+        # Sample from training data to estimate positive rate
+        sample_batch = train_gen[0]
+        y_sample = sample_batch[1] if isinstance(sample_batch, tuple) else sample_batch
+        pos_rate = float(np.mean(y_sample > 0.5))
+        if pos_rate > 0 and pos_rate < 1:
+            neg_rate = 1.0 - pos_rate
+            # class_weight for binary: weight inversely proportional to frequency
+            cw = {0: 0.5 / neg_rate, 1: 0.5 / pos_rate}
+            logger.info(f"Class weights: {{0: {cw[0]:.3f}, 1: {cw[1]:.3f}}} (pos_rate={pos_rate:.4f})")
+        else:
+            cw = None
+            logger.warning(f"Cannot compute class weights (pos_rate={pos_rate}), training without")
+    except Exception as e:
+        logger.warning(f"Class weight computation failed: {e}, training without")
+        cw = None
+
     logger.info("Training model...")
-    history = model.fit(train_gen, validation_data=val_gen, callbacks=[early_stop, reduce_lr], epochs=500, verbose=1)
+    history = model.fit(train_gen, validation_data=val_gen, callbacks=[early_stop, reduce_lr], 
+                        epochs=500, class_weight=cw, verbose=1)
 
     # ========================================================================
-    # STEP 4b: Save model, scaler, and feature_cols for live trading
+    # STEP 4b: Model quality gate — refuse to deploy a bad model
     # ========================================================================
-    logger.info("Step 4b: Saving model artifacts for live trading...")
+    logger.info("Step 4b: Checking model quality before deployment...")
+    
+    MIN_VAL_AUC = 0.55  # Minimum required val AUC (above random = 0.5)
+    final_val_auc = history.history.get("val_auc", [0])[-1]
+    final_val_loss = history.history.get("val_loss", [float('inf')])[-1]
+    logger.info(f"Final val AUC: {final_val_auc:.4f}, val loss: {final_val_loss:.4f}")
+    
+    if final_val_auc < MIN_VAL_AUC:
+        logger.error(
+            f"MODEL QUALITY GATE FAILED: val AUC {final_val_auc:.4f} < minimum {MIN_VAL_AUC}. "
+            f"Model is near-random and will NOT be saved. "
+            f"Check data quality, class balance, and feature engineering."
+        )
+        return
+    
+    logger.info(f"Model quality gate PASSED (val AUC {final_val_auc:.4f} >= {MIN_VAL_AUC})")
+
+    # ========================================================================
+    # STEP 4c: Save model, scaler, and feature_cols for live trading
+    # ========================================================================
+    logger.info("Step 4c: Saving model artifacts for live trading...")
     
     model.save(CONFIG["MODEL_DIR"] / "lstm_model.keras")
     logger.info(f"Saved model to {CONFIG['MODEL_DIR'] / 'lstm_model.keras'}")
@@ -599,6 +640,16 @@ def main():
     plt.savefig(CONFIG["FORECAST_DIR"] / "training_history.png", dpi=150)
     plt.close()
     logger.info("Saved training history plot")
+
+    # Save training history as JSON for programmatic comparison
+    history_data = {
+        k: [float(v) for v in vals] for k, vals in history.history.items()
+    }
+    history_data["final_val_auc"] = float(final_val_auc)
+    history_data["final_val_loss"] = float(final_val_loss)
+    with open(CONFIG["MODEL_DIR"] / "training_history.json", "w") as f:
+        json.dump(history_data, f, indent=2)
+    logger.info("Saved training history JSON")
 
     # ========================================================================
     # STEP 5: Feature importance

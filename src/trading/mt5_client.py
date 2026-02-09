@@ -85,11 +85,14 @@ def with_retries(max_retries: int = 3, base_delay: float = 1.0, max_delay: float
 class MT5Client:
     """Thin REST wrapper around the MT5 Bridge at localhost:8787."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 8787, magic: int = 24001):
+    def __init__(self, host: str = "127.0.0.1", port: int = 8787, magic: int = 24001,
+                 api_key: Optional[str] = None):
         self.base_url = f"http://{host}:{port}"
         self.magic = magic
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
+        if api_key:
+            self.session.headers.update({"X-API-Key": api_key})
 
     # ------------------------------------------------------------------
     # Connectivity
@@ -175,7 +178,9 @@ class MT5Client:
     # ------------------------------------------------------------------
     # Order execution
     # ------------------------------------------------------------------
-    @with_retries(max_retries=2, base_delay=1.0)
+    # NOTE: No retries on order placement to prevent duplicate positions.
+    # If the first attempt succeeded but the HTTP response was lost, a retry
+    # would create a second position with double exposure.
     def place_market_order(
         self,
         symbol: str,

@@ -8,7 +8,7 @@
     "FEATURES_PATH": "outputs/models/feature_cols.json",
     "SYMBOLS_PATH": "config/symbols.json",
 
-    "MIN_ACCEPTED": 0.10,
+    "MIN_ACCEPTED": 0.50,
     "STD_FACTOR": 1.0,
     "MC_DROPOUT_SAMPLES": 50,
     "WINDOW_SIZE": 90,

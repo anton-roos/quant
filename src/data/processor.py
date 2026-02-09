@@ -195,12 +195,12 @@ def process_file(csv_path, output_path):
     df["EMA10"] = df["close"].ewm(span=10, adjust=False).mean()
     df["EMA30"] = df["close"].ewm(span=30, adjust=False).mean()
 
-    #Relative strength index (RSI) calculation
+    #Relative strength index (RSI) calculation — Wilder's exponential smoothing
     delta = df["close"].diff()
     gain = np.where(delta > 0, delta, 0)
     loss = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gain).rolling(window=14).mean()
-    avg_loss = pd.Series(loss).rolling(window=14).mean()
+    avg_gain = pd.Series(gain).ewm(alpha=1.0/14, min_periods=14, adjust=False).mean()
+    avg_loss = pd.Series(loss).ewm(alpha=1.0/14, min_periods=14, adjust=False).mean()
     rs = avg_gain / avg_loss
     df["RSI"] = 100 - (100 / (1 + rs))
 

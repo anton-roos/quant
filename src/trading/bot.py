@@ -42,7 +42,8 @@ from tensorflow.keras.layers import Dropout
 from src.trading.mt5_client import MT5Client
 from src.trading.trade_journal import TradeJournal
 from src.trading.notifications import Notifier
-from src.data.processor import process_file
+from src.trading.config_validator import validate_config_or_die
+from src.data.processor import process_file, invalidate_cross_asset_cache
 from src.data.features.mt5_bridge_downloader import _sanitize_filename
 
 # ---------------------------------------------------------------------------
@@ -94,7 +95,7 @@ DEFAULT_CONFIG = {
     "PROCESSED_DIR": "src/data/indicators_data/processed",
 
     # Strategy parameters (must match backtest)
-    "MIN_ACCEPTED": 0.10,
+    "MIN_ACCEPTED": 0.50,
     "STD_FACTOR": 1.0,
     "MC_DROPOUT_SAMPLES": 50,
     "WINDOW_SIZE": 90,
@@ -176,6 +177,7 @@ class TradingBot:
 
     def __init__(self):
         self.config = load_config()
+        validate_config_or_die(self.config)  # Fail fast on bad config
         self.running = False
         self.start_equity: Optional[float] = None
         self.peak_equity: Optional[float] = None
@@ -187,6 +189,7 @@ class TradingBot:
             host=self.config["MT5_HOST"],
             port=self.config["MT5_PORT"],
             magic=self.config["MAGIC"],
+            api_key=self.config.get("BRIDGE_API_KEY"),
         )
 
         # Load model artifacts
@@ -241,6 +244,23 @@ class TradingBot:
         with open(features_path, "r") as f:
             self.feature_cols = json.load(f)
         logger.info(f"Feature cols loaded: {len(self.feature_cols)} features")
+
+        # Verify feature hash matches saved model artifacts (detect processor changes)
+        feature_hash_path = PROJECT_ROOT / "outputs" / "models" / "feature_hash.txt"
+        if feature_hash_path.exists():
+            import hashlib
+            expected_hash = feature_hash_path.read_text().strip()
+            actual_hash = hashlib.sha256(
+                json.dumps(sorted(self.feature_cols)).encode()
+            ).hexdigest()[:16]
+            if actual_hash != expected_hash:
+                logger.warning(
+                    f"FEATURE HASH MISMATCH: saved={expected_hash}, current={actual_hash}. "
+                    f"The processor may have changed since the model was trained. "
+                    f"Consider retraining with `python src/inference/run_forecast.py`."
+                )
+            else:
+                logger.info(f"Feature hash verified: {actual_hash}")
 
     def _load_symbols(self):
         """Load symbol definitions from config/symbols.json."""
@@ -348,6 +368,7 @@ class TradingBot:
 
         # Reprocess all instruments
         logger.info("Reprocessing all instruments...")
+        invalidate_cross_asset_cache()  # Clear stale cross-asset features before reprocessing
         for subfolder in ["forex", "indices", "commodities", "crypto"]:
             raw_sub = raw_base / subfolder
             proc_sub = processed_base / subfolder
@@ -1057,6 +1078,21 @@ class TradingBot:
 
             # Direction-aware correlation filter
             if self._is_too_correlated(mt5_name, candidate["side"], open_positions):
+                continue
+
+            # Asset-class concentration filter: max 2 positions per asset class
+            MAX_PER_ASSET_CLASS = 2
+            candidate_type = candidate.get("type", "Unknown")
+            open_types = [
+                next((s.get("type", "") for s in self.symbols if s["name"] == p["symbol"]), "")
+                for p in open_positions
+            ]
+            same_class_count = sum(1 for t in open_types if t == candidate_type)
+            if same_class_count >= MAX_PER_ASSET_CLASS:
+                logger.info(
+                    f"  Skipping {mt5_name} — already {same_class_count} positions "
+                    f"in {candidate_type} (max {MAX_PER_ASSET_CLASS})"
+                )
                 continue
 
             try:

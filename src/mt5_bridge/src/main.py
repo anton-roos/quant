@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from pydantic import field_validator
@@ -7,6 +7,8 @@ from typing import Optional
 import numpy as np
 import asyncio
 import json
+import secrets
+import os
 
 from .models import (
     PlaceOrderRequest, ModifyOrderRequest, CloseOrderRequest, CancelOrderRequest,
@@ -32,11 +34,15 @@ class Settings(BaseSettings):
     bridge_port: int = 8787
     log_dir: str = "./logs"
     
+    # API key for authentication (set via BRIDGE_API_KEY env var)
+    # If empty/None, authentication is disabled (local dev mode)
+    bridge_api_key: Optional[str] = None
+    
     mt5_login: Optional[int] = None
     mt5_password: Optional[str] = None
     mt5_server: Optional[str] = None
     
-    @field_validator('mt5_login', 'mt5_password', 'mt5_server', mode='before')
+    @field_validator('mt5_login', 'mt5_password', 'mt5_server', 'bridge_api_key', mode='before')
     @classmethod
     def empty_str_to_none(cls, v):
         """Convert empty strings to None."""
@@ -84,6 +90,28 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+
+# ---------------------------------------------------------------------------
+# API Key Authentication Middleware
+# ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def authenticate_request(request: Request, call_next):
+    """Verify API key on every request if BRIDGE_API_KEY is configured."""
+    api_key = settings.bridge_api_key
+    if api_key is not None:
+        # Allow health check without auth
+        if request.url.path not in ("/", "/health"):
+            provided_key = request.headers.get("X-API-Key", "")
+            if not secrets.compare_digest(provided_key, api_key):
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": {"code": "UNAUTHORIZED", "message": "Invalid or missing X-API-Key header"}}
+                )
+    response = await call_next(request)
+    return response
+
 
 def error_response(code: ErrorCode, message: str, status_code: int = 400) -> JSONResponse:
     """Create standardized error response."""
