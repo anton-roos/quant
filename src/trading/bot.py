@@ -40,6 +40,7 @@ from keras.models import load_model
 
 from src.models.layers import MCDropout
 from src.utils.constants import sanitize_filename, CATEGORY_TYPE_TO_FOLDER
+from src.utils.datetime_utils import parse_iso_datetime_to_utc
 from src.trading.mt5_client import MT5Client
 from src.trading.trade_journal import TradeJournal
 from src.trading.notifications import Notifier
@@ -937,9 +938,8 @@ class TradingBot:
                 open_time_str = pos.get("time", "")
                 if not open_time_str:
                     continue
-                try:
-                    open_time = datetime.fromisoformat(open_time_str.replace("Z", "+00:00").replace("+00:00", ""))
-                except ValueError:
+                open_time = parse_iso_datetime_to_utc(open_time_str)
+                if open_time is None:
                     continue
 
                 hours_open = (now - open_time).total_seconds() / 3600

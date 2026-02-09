@@ -11,7 +11,7 @@ import logging
 from pathlib import Path
 
 # Set random seeds for reproducibility BEFORE importing TensorFlow/numpy
-from src.utils.constants import RANDOM_SEED, EXCLUDED_COLS, HORIZONS, HORIZON_DAYS, CATEGORY_FOLDERS
+from src.utils.constants import RANDOM_SEED, EXCLUDED_COLS, HORIZONS, HORIZON_DAYS, CATEGORY_FOLDERS, sanitize_filename
 
 os.environ['PYTHONHASHSEED'] = str(RANDOM_SEED)
 os.environ['TF_DETERMINISTIC_OPS'] = '1'
@@ -436,12 +436,34 @@ def main():
     """Main execution flow"""
     logger.info("Starting LSTM forecasting pipeline...")
     
+    # Load allowed symbols from symbols.json to avoid training on stale/
+    # non-tradeable data (e.g. leftover USDZAR from a previous download).
+    symbols_file = Path(__file__).parent.parent.parent / "config" / "symbols.json"
+    allowed_stems: set[str] | None = None
+    if symbols_file.exists():
+        with open(symbols_file) as f:
+            _sym_data = json.load(f)
+        allowed_stems = {
+            sanitize_filename(s["name"]) + "_daily_processed"
+            for s in _sym_data.get("symbols", [])
+        }
+        logger.info(f"Loaded {len(allowed_stems)} allowed symbols from symbols.json")
+
     # Load all CSVs from category subdirectories
     all_csvs = []
     for category in ["forex", "indices", "commodities", "crypto"]:
         cat_dir = CONFIG["DATA_DIR"] / category
         if cat_dir.exists():
             all_csvs.extend(sorted(glob.glob(str(cat_dir / "*.csv"))))
+
+    # Filter out any CSVs not in symbols.json
+    if allowed_stems is not None:
+        before = len(all_csvs)
+        all_csvs = [p for p in all_csvs if Path(p).stem in allowed_stems]
+        skipped = before - len(all_csvs)
+        if skipped:
+            logger.warning(f"Skipped {skipped} CSVs not in symbols.json")
+
     logger.info(f"Found {len(all_csvs)} instruments")
     
     if not all_csvs:

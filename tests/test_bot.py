@@ -260,6 +260,57 @@ class TestSignalGeneration:
         assert isinstance(candidates, list)
 
 
+class TestPositionReview:
+    def test_review_open_positions_handles_naive_and_aware_datetimes(self, tmp_workspace):
+        """_review_open_positions should not crash on naive/aware mixes.
+
+        MT5 may return timestamps with an explicit offset, a trailing 'Z',
+        or (rarely) a naive ISO datetime. The bot should normalize to UTC.
+        """
+        bot = next(_build_bot(tmp_workspace, {"POSITION_REVIEW_HOURS": 24}))
+
+        stale_time_utc = datetime.now(timezone.utc) - timedelta(hours=30)
+        stale_time_z = stale_time_utc.isoformat().replace("+00:00", "Z")
+        stale_time_naive = stale_time_utc.replace(tzinfo=None).isoformat()
+
+        bot.mt5.bot_positions.return_value = [
+            {
+                "ticket": 101,
+                "symbol": "EURUSD",
+                "time": stale_time_utc.isoformat(),
+                "price_current": 1.1000,
+                "profit": 1.23,
+                "commission": 0.0,
+                "swap": 0.0,
+            },
+            {
+                "ticket": 102,
+                "symbol": "GBPUSD",
+                "time": stale_time_z,
+                "price_current": 1.2500,
+                "profit": -2.0,
+                "commission": 0.0,
+                "swap": 0.0,
+            },
+            {
+                "ticket": 103,
+                "symbol": "USDJPY",
+                "time": stale_time_naive,
+                "price_current": 150.00,
+                "profit": 0.0,
+                "commission": 0.0,
+                "swap": 0.0,
+            },
+        ]
+
+        bot._review_open_positions()
+
+        assert bot.mt5.close_position.call_count == 3
+        bot.mt5.close_position.assert_any_call(101, comment="bot:stale")
+        bot.mt5.close_position.assert_any_call(102, comment="bot:stale")
+        bot.mt5.close_position.assert_any_call(103, comment="bot:stale")
+
+
 class TestPositionSizing:
     """Tests for _compute_lot_size and _compute_sl_tp."""
 
