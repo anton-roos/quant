@@ -9,12 +9,7 @@ src/data/indicators_data/raw/
 src/data/indicators_data/processed/
 
 # Outputs
-outputs/forecasts/
-outputs/videos/
-outputs/models/
-outputs/cache/
-outputs/bot_logs/
-outputs/bridge_logs/
+outputs/*
 
 # MT5 Bridge logs
 src/mt5_bridge/logs/

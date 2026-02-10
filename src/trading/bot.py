@@ -104,8 +104,11 @@ DEFAULT_CONFIG = {
     "RISK_PER_TRADE_PCT": 1.0,         # Default % of equity risked per trade
     "DEFAULT_LOT_SIZE": 0.01,          # Fallback if sizing calc fails
     "MAX_LOT_SIZE": 1.0,               # Hard cap
-    "ATR_SL_MULTIPLIER": 2.0,          # SL = ATR * multiplier
-    "ATR_TP_MULTIPLIER": 3.0,          # TP = ATR * multiplier (1.5× reward/risk)
+    "ATR_SL_MULTIPLIER": 1.0,          # SL = ATR * multiplier * horizon_scale
+    "ATR_TP_MULTIPLIER": 1.5,          # TP = ATR * multiplier * horizon_scale
+    "HORIZON_SL_SCALE": {"1d": 0.5, "1w": 1.0, "1m": 2.0, "6m": 4.0},
+    "HORIZON_TP_SCALE": {"1d": 0.5, "1w": 1.0, "1m": 2.0, "6m": 4.0},
+    "HORIZON_MAX_HOLD_HOURS": {"1d": 36, "1w": 168, "1m": 720, "6m": 4320},
     "MAX_DRAWDOWN_PCT": 15.0,          # Halt trading if drawdown exceeds this
 
     # Per-instrument-type slot allocation
@@ -122,6 +125,9 @@ DEFAULT_CONFIG = {
     "TRAILING_STOP_ENABLED": True,
     "BREAKEVEN_AFTER_R": 1.0,           # Move SL to breakeven after this many R of profit
     "TRAILING_ATR_MULTIPLIER": 1.5,     # Trail SL at this × ATR below/above current price
+
+    # Signal reversal exit
+    "SIGNAL_REVERSAL_MARGIN": 0.04,     # Close if opposite signal exceeds same-side by this
 
     # Spread / liquidity gate
     "MAX_SPREAD_ATR_RATIO": 0.15,      # Skip entry if spread > ATR * this ratio
@@ -476,6 +482,13 @@ class TradingBot:
         horizon_days = {"1d": 1, "1w": 5, "1m": 21, "6m": 126}
         n_horizons = len(horizons)
 
+        # Diagnostic counters
+        diag_no_data = 0
+        diag_vol_filtered = 0
+        diag_below_threshold = 0
+        diag_evaluated = 0
+        diag_best_adj: Dict[str, float] = {}  # track best adj_prob per symbol
+
         for sym in self.symbols:
             mt5_name = sym["name"]
             safe_name = sanitize_filename(mt5_name)
@@ -485,6 +498,8 @@ class TradingBot:
 
             result = self._prepare_features(csv_path)
             if result is None:
+                diag_no_data += 1
+                logger.debug(f"  {mt5_name}: skipped — no data or insufficient rows")
                 continue
 
             X, df = result
@@ -502,12 +517,16 @@ class TradingBot:
                     pctile = float((atr_series < latest_atr).sum() / len(atr_series) * 100)
                     lo = self.config.get("ATR_PERCENTILE_LOW", 10)
                     hi = self.config.get("ATR_PERCENTILE_HIGH", 95)
-                    if pctile < lo or pctile > hi:
-                        logger.debug(
-                            f"  Skipping {mt5_name}: ATR percentile {pctile:.0f}% "
-                            f"outside [{lo}, {hi}]"
+                    if pctile < lo or pctile >= hi:
+                        diag_vol_filtered += 1
+                        logger.info(
+                            f"  {mt5_name}: volatility-filtered — ATR percentile {pctile:.0f}% "
+                            f"outside [{lo}, {hi})"
                         )
                         continue
+
+            diag_evaluated += 1
+            sym_best_adj = 0.0
 
             for i, h in enumerate(horizons):
                 # --- BUY signal (upside probability, outputs 0..3) ---
@@ -529,11 +548,15 @@ class TradingBot:
                         "atr": latest_atr,
                         "type": sym.get("type", "Unknown"),
                     })
+                else:
+                    diag_below_threshold += 1
 
                 # --- SELL signal (downside probability, outputs 4..7) ---
                 pred_prob_down = float(mean_probs[0, n_horizons + i])
                 pred_std_down = float(std_probs[0, n_horizons + i])
                 adj_prob_down = pred_prob_down - self.config["STD_FACTOR"] * pred_std_down
+
+                sym_best_adj = max(sym_best_adj, adj_prob, adj_prob_down)
 
                 if adj_prob_down > self.config["MIN_ACCEPTED"]:
                     candidates.append({
@@ -549,6 +572,26 @@ class TradingBot:
                         "atr": latest_atr,
                         "type": sym.get("type", "Unknown"),
                     })
+                else:
+                    diag_below_threshold += 1
+
+            diag_best_adj[mt5_name] = sym_best_adj
+
+        # --- Diagnostic summary ---
+        total_syms = len(self.symbols)
+        logger.info(
+            f"Signal diagnostics: {total_syms} symbols | "
+            f"{diag_no_data} no-data | {diag_vol_filtered} vol-filtered | "
+            f"{diag_evaluated} evaluated | {diag_below_threshold} horizon-checks below threshold"
+        )
+        if diag_best_adj:
+            # Show top 5 symbols closest to passing threshold
+            min_accepted = self.config["MIN_ACCEPTED"]
+            top5 = sorted(diag_best_adj.items(), key=lambda x: x[1], reverse=True)[:5]
+            logger.info(
+                f"Top adj_prob vs threshold ({min_accepted}): "
+                + ", ".join(f"{name}={val:.4f}" for name, val in top5)
+            )
 
         # Apply horizon weights to ranking score
         horizon_weights = self.config.get("HORIZON_WEIGHTS", {"1d": 1.5, "1w": 1.2, "1m": 1.0, "6m": 0.6})
@@ -673,14 +716,19 @@ class TradingBot:
             return self.config["DEFAULT_LOT_SIZE"]
 
     def _compute_sl_tp(
-        self, side: str, close: float, atr: float, digits: int
+        self, side: str, close: float, atr: float, digits: int,
+        horizon: str = "1w",
     ) -> Tuple[Optional[float], Optional[float]]:
-        """Compute SL and TP based on ATR."""
+        """Compute SL and TP based on ATR, scaled by signal horizon."""
         if atr <= 0:
             return None, None
 
-        sl_dist = atr * self.config["ATR_SL_MULTIPLIER"]
-        tp_dist = atr * self.config["ATR_TP_MULTIPLIER"]
+        # Horizon-aware scaling (default 1.0 = use raw multiplier)
+        sl_scale = self.config.get("HORIZON_SL_SCALE", {}).get(horizon, 1.0)
+        tp_scale = self.config.get("HORIZON_TP_SCALE", {}).get(horizon, 1.0)
+
+        sl_dist = atr * self.config["ATR_SL_MULTIPLIER"] * sl_scale
+        tp_dist = atr * self.config["ATR_TP_MULTIPLIER"] * tp_scale
 
         if side == "BUY":
             sl = round(close - sl_dist, digits)
@@ -923,12 +971,131 @@ class TradingBot:
     # ------------------------------------------------------------------
     # Position management
     # ------------------------------------------------------------------
+    def _review_signals_on_open_positions(self):
+        """Re-evaluate open positions against the current model predictions.
+
+        For each position:
+        - Re-run MC inference for the symbol.
+        - If the model now favours the *opposite* direction (adj_prob for the
+          reverse side exceeds the open side by SIGNAL_REVERSAL_MARGIN), close
+          the position as a signal-reversal exit.
+        - If the position has no horizon tag (legacy order) and no SL/TP set,
+          apply the default 1w horizon SL/TP so it isn't left unprotected.
+        - Log a compact review summary for each position.
+        """
+        reversal_margin = self.config.get("SIGNAL_REVERSAL_MARGIN", 0.04)
+        processed_base = PROJECT_ROOT / self.config["PROCESSED_DIR"]
+
+        try:
+            positions = self.mt5.bot_positions()
+        except Exception as e:
+            logger.error(f"Signal review: failed to fetch positions: {e}")
+            return
+
+        if not positions:
+            return
+
+        logger.info(f"Signal review: evaluating {len(positions)} open position(s)")
+
+        for pos in positions:
+            mt5_name = pos["symbol"]
+            ticket = pos["ticket"]
+            side = pos.get("type", "BUY")
+            price_open = pos.get("price_open", 0)
+            current_sl = pos.get("sl", 0)
+            current_tp = pos.get("tp", 0)
+            comment = pos.get("comment", "")
+            profit = pos.get("profit", 0)
+
+            # Look up symbol config
+            sym_entry = next((s for s in self.symbols if s["name"] == mt5_name), None)
+            if sym_entry is None:
+                logger.debug(f"  Signal review: {mt5_name} not in symbol list, skipping")
+                continue
+
+            safe_name = sanitize_filename(mt5_name)
+            cat_folder = CATEGORY_TYPE_TO_FOLDER.get(sym_entry.get("type", ""), "other")
+            csv_path = processed_base / cat_folder / f"{safe_name}_daily_processed.csv"
+
+            result = self._prepare_features(csv_path)
+            if result is None:
+                logger.debug(f"  Signal review: no data for {mt5_name}")
+                continue
+
+            X, df = result
+            mean_probs, std_probs = self._mc_predict(X)
+
+            # Best adj_prob for BUY side (horizons 0..3) and SELL side (4..7)
+            n_horizons = 4
+            std_factor = self.config["STD_FACTOR"]
+            buy_adj = max(
+                float(mean_probs[0, i]) - std_factor * float(std_probs[0, i])
+                for i in range(n_horizons)
+            )
+            sell_adj = max(
+                float(mean_probs[0, n_horizons + i]) - std_factor * float(std_probs[0, n_horizons + i])
+                for i in range(n_horizons)
+            )
+
+            same_side_adj = buy_adj if side == "BUY" else sell_adj
+            opp_side_adj = sell_adj if side == "BUY" else buy_adj
+
+            logger.info(
+                f"  {mt5_name} #{ticket} {side} pnl={profit:+.2f} | "
+                f"same_side={same_side_adj:.4f} opp_side={opp_side_adj:.4f} "
+                f"(reversal margin={reversal_margin})"
+            )
+
+            # --- Signal reversal: close if opposing signal is significantly stronger ---
+            if opp_side_adj - same_side_adj > reversal_margin:
+                logger.info(
+                    f"  [REVERSAL] Closing {mt5_name} #{ticket} {side} — "
+                    f"model now favours opposite (opp={opp_side_adj:.4f} vs same={same_side_adj:.4f})"
+                )
+                try:
+                    self.mt5.close_position(ticket, comment="bot:signal_reversal")
+                    self.journal.record_exit(
+                        ticket=ticket,
+                        exit_price=pos.get("price_current", 0),
+                        realized_pnl=profit,
+                        commission=pos.get("commission", 0),
+                        swap=pos.get("swap", 0),
+                    )
+                    if self.config.get("NOTIFY_ON_TRADE", True):
+                        self.notifier.send(
+                            f"🔄 Signal reversal: closed {side} {mt5_name} #{ticket} pnl={profit:+.2f}"
+                        )
+                except Exception as e:
+                    logger.error(f"  Failed to close reversed position {ticket}: {e}")
+                continue
+
+            # --- Patch legacy positions: apply SL/TP if missing ---
+            if (not current_sl or current_sl == 0) and (not current_tp or current_tp == 0):
+                atr = self._get_current_atr(mt5_name)
+                if atr > 0:
+                    try:
+                        sym_info = self.mt5.symbol_info(mt5_name)
+                        digits = sym_info.get("digits", 5)
+                        # Default to 1w horizon for legacy positions
+                        sl, tp = self._compute_sl_tp(side, price_open, atr, digits, horizon="1w")
+                        if sl and tp:
+                            self.mt5.modify_position(ticket, sl=sl, tp=tp)
+                            logger.info(
+                                f"  [PATCH] {mt5_name} #{ticket}: set SL={sl} TP={tp} "
+                                f"(legacy position, applied 1w horizon)"
+                            )
+                    except Exception as e:
+                        logger.warning(f"  [PATCH] Failed to set SL/TP on {ticket}: {e}")
+
     def _review_open_positions(self):
         """Close bot positions that have been open too long or hit conditions.
+        Uses horizon-specific hold times when available (read from order comment).
         Records exits in the trade journal."""
-        review_hours = self.config.get("POSITION_REVIEW_HOURS", 0)
-        if review_hours <= 0:
+        default_review_hours = self.config.get("POSITION_REVIEW_HOURS", 0)
+        if default_review_hours <= 0:
             return
+
+        horizon_max_hold = self.config.get("HORIZON_MAX_HOLD_HOURS", {})
 
         try:
             positions = self.mt5.bot_positions()
@@ -943,9 +1110,21 @@ class TradingBot:
                     continue
 
                 hours_open = (now - open_time).total_seconds() / 3600
+
+                # Extract horizon from order comment (format: "bot:<horizon>:<adj_prob>")
+                comment = pos.get("comment", "")
+                review_hours = default_review_hours
+                horizon_tag = ""
+                if comment.startswith("bot:"):
+                    parts = comment.split(":")
+                    if len(parts) >= 2:
+                        horizon_tag = parts[1]
+                        review_hours = horizon_max_hold.get(horizon_tag, default_review_hours)
+
                 if hours_open > review_hours:
                     logger.info(
-                        f"Position {pos['ticket']} ({pos['symbol']}) open {hours_open:.1f}h — closing (stale)"
+                        f"Position {pos['ticket']} ({pos['symbol']}) open {hours_open:.1f}h "
+                        f"(limit {review_hours}h, horizon={horizon_tag or 'default'}) — closing (stale)"
                     )
                     try:
                         result = self.mt5.close_position(pos["ticket"], comment="bot:stale")
@@ -1024,6 +1203,9 @@ class TradingBot:
 
         # 2b. Manage trailing stops on open positions
         self._manage_trailing_stops()
+
+        # 2c. Re-evaluate open positions against current model signals
+        self._review_signals_on_open_positions()
 
         # 3. Count current bot positions & compute per-type slot usage
         try:
@@ -1143,8 +1325,9 @@ class TradingBot:
                 logger.debug(f"  Quote failed for {mt5_name}: {e}, using daily close")
                 live_price = candidate["close"]
 
-            # Compute SL/TP from live price
-            sl, tp = self._compute_sl_tp(side, live_price, atr, digits)
+            # Compute SL/TP from live price (horizon-aware)
+            sl, tp = self._compute_sl_tp(side, live_price, atr, digits,
+                                         horizon=candidate["horizon"])
 
             # Compute lot size
             lot_size = self._compute_lot_size(sym_info, atr, live_price,

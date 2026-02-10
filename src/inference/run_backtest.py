@@ -48,6 +48,7 @@ class BacktestConfig:
     random_runs: int = 50
     min_accepted: float = 0.50
     std_factor: float = 1.0
+    # Legacy: historical global cap. Live bot uses GLOBAL_MAX_SLOTS.
     max_concurrent: int = 3
     slippage_bps: float = 5.0
     swap_bps_per_day: float = 1.5
@@ -56,10 +57,36 @@ class BacktestConfig:
     risk_per_type: Dict[str, float] = field(default_factory=lambda: {
         "Index": 1.0, "Forex": 0.75, "Crypto": 0.5, "Commodity": 1.0,
     })
+
+    # Slot allocation (matches live SlotManager defaults)
+    slots_per_type: Dict[str, int] = field(default_factory=lambda: {
+        "Index": 2, "Forex": 3, "Crypto": 1, "Commodity": 2,
+    })
+    global_max_slots: int = 5
+
+    # Global risk budget across open trades (mirrors live SlotManager)
     atr_sl_multiplier: float = 2.0
     atr_period: int = 14
     max_alloc_per_trade: float = 5.0   # Max leverage per single trade
     global_max_risk_pct: float = 5.0   # Total portfolio risk cap
+
+    # Candidate ranking (matches live bot)
+    horizon_weights: Dict[str, float] = field(default_factory=lambda: {
+        "1d": 1.5, "1w": 1.2, "1m": 1.0, "6m": 0.6,
+    })
+
+    # Volatility / regime filter (approximation using forecast _ATR proxy)
+    volatility_filter_enabled: bool = True
+    atr_percentile_low: int = 10
+    atr_percentile_high: int = 95
+    atr_percentile_lookback: int = 252
+
+    # Direction-aware correlation filter (computed from forecast Close series)
+    correlation_threshold: float = 0.7
+    correlation_lookback: int = 60
+
+    # Live bot closes stale positions after N hours; approximate in daily bars.
+    position_review_hours: float = 24
     periods: Dict[str, int] = field(default_factory=lambda: dict(DEFAULT_PERIODS))
     project_root: Path = field(default_factory=lambda: Path(os.getcwd()))
     symbols_path: Path = field(default_factory=lambda: Path("config/symbols.json"))
@@ -267,7 +294,7 @@ class Backtester:
                 self.total_trades += 1
 
             # ------- Check for new entries -------
-            slots_available = cfg.max_concurrent - len(active_positions)
+            slots_available = self._global_slots_remaining(active_positions)
             if slots_available <= 0:
                 self.strategy_history.append(strategy_value)
                 continue
@@ -279,7 +306,7 @@ class Backtester:
                 self.strategy_history.append(strategy_value)
                 continue
 
-            candidates.sort(key=lambda x: x["Adj_Prob"], reverse=True)
+            candidates.sort(key=lambda x: x.get("Weighted_Score", x["Adj_Prob"]), reverse=True)
 
             filled = 0
             for best in candidates:
@@ -288,7 +315,21 @@ class Backtester:
                 if best["Symbol"] in open_symbols:
                     continue
 
+                # Per-type slots (mirrors live SlotManager)
+                sym_type = best.get("Type", "Forex")
+                if self._type_slots_remaining(active_positions, sym_type) <= 0:
+                    continue
+
+                # Direction-aware correlation filter (mirrors live risk_filters)
+                if self._is_too_correlated(best["Symbol"], best["Side"], active_positions, date):
+                    continue
+
                 exit_idx = min(i + best["Days"], len(self.common_dates) - 1)
+                # Approximate live POSITION_REVIEW_HOURS by capping holding period.
+                review_hours = float(getattr(cfg, "position_review_hours", 0) or 0)
+                if review_hours > 0:
+                    max_hold_days = max(1, int(round(review_hours / 24.0)))
+                    exit_idx = min(exit_idx, min(i + max_hold_days, len(self.common_dates) - 1))
 
                 # Risk-based allocation mirroring live bot's position sizing
                 sym_df = self.all_forecasts.get(best["Symbol"])
@@ -304,10 +345,7 @@ class Backtester:
                 active_risk = sum(
                     p.get("risk_pct_used", 0.0) for p in active_positions
                 )
-                sym_type = self.symbol_types.get(best["Symbol"], "Forex")
-                trade_risk_pct = cfg.risk_per_type.get(
-                    sym_type, cfg.risk_per_trade_pct,
-                )
+                trade_risk_pct = cfg.risk_per_type.get(sym_type, cfg.risk_per_trade_pct)
                 if active_risk + trade_risk_pct > cfg.global_max_risk_pct:
                     continue
 
@@ -348,9 +386,25 @@ class Backtester:
                 continue
             if symbol in open_symbols:
                 continue
+
+            # Volatility / regime filter (approx using _ATR proxy)
+            if getattr(cfg, "volatility_filter_enabled", False) and "_ATR" in df.columns:
+                lookback = int(getattr(cfg, "atr_percentile_lookback", 252))
+                atr_series = df["_ATR"].dropna().iloc[-lookback:]
+                current_atr = float(df.loc[date, "_ATR"]) if "_ATR" in df.columns else 0.0
+                if len(atr_series) > 20 and np.isfinite(current_atr):
+                    pctile = float((atr_series < current_atr).sum() / len(atr_series) * 100)
+                    lo = int(getattr(cfg, "atr_percentile_low", 10))
+                    hi = int(getattr(cfg, "atr_percentile_high", 95))
+                    if pctile < lo or pctile > hi:
+                        continue
+
             row = df.loc[date]
             for label, days in cfg.periods.items():
                 actual_logr = float(row.get(f"Actual_LogR_{label}", np.nan))
+
+                sym_type = self.symbol_types.get(symbol, "Forex")
+                weight = cfg.horizon_weights.get(label, 1.0)
 
                 # BUY
                 prob_col = f"Pred_Prob_{label}"
@@ -365,6 +419,8 @@ class Backtester:
                             "Days": days, "Pred_Prob": pred_prob,
                             "Pred_Prob_Std": pred_std, "Adj_Prob": adj_prob,
                             "Actual_LogR": actual_logr,
+                            "Type": sym_type,
+                            "Weighted_Score": adj_prob * weight,
                         })
 
                 # SELL
@@ -380,8 +436,90 @@ class Backtester:
                             "Days": days, "Pred_Prob": pred_prob_down,
                             "Pred_Prob_Std": pred_std_down, "Adj_Prob": adj_prob_down,
                             "Actual_LogR": actual_logr,
+                            "Type": sym_type,
+                            "Weighted_Score": adj_prob_down * weight,
                         })
         return candidates
+
+    # ------------------------------------------------------------------
+    # Live-bot-like pre-trade filters (adapted to forecast data)
+    # ------------------------------------------------------------------
+
+    def _global_slots_remaining(self, active_positions: List[dict]) -> int:
+        """Global slot availability (mirrors live GLOBAL_MAX_SLOTS)."""
+        cap = int(getattr(self.cfg, "global_max_slots", self.cfg.max_concurrent))
+        return max(0, cap - len(active_positions))
+
+    def _open_by_type(self, active_positions: List[dict]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for p in active_positions:
+            t = p.get("Type") or self.symbol_types.get(p.get("Symbol", ""), "Forex")
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
+    def _type_slots_remaining(self, active_positions: List[dict], sym_type: str) -> int:
+        limit = self.cfg.slots_per_type.get(sym_type, 0)
+        used = self._open_by_type(active_positions).get(sym_type, 0)
+        return max(0, int(limit) - int(used))
+
+    def _is_too_correlated(
+        self,
+        candidate_symbol: str,
+        candidate_side: str,
+        active_positions: List[dict],
+        date,
+    ) -> bool:
+        """Direction-aware correlation filter using forecast Close series.
+
+        Approximates live behavior: reject if adding the candidate would
+        concentrate directional exposure.
+        """
+        if not active_positions:
+            return False
+
+        threshold = float(getattr(self.cfg, "correlation_threshold", 0.7))
+        lookback = int(getattr(self.cfg, "correlation_lookback", 60))
+
+        cand_df = self.all_forecasts.get(candidate_symbol)
+        if cand_df is None or "Close" not in cand_df.columns:
+            return False
+        if date not in cand_df.index:
+            return False
+
+        cand_close = cand_df.loc[:date, "Close"].dropna()
+        if len(cand_close) < lookback + 5:
+            return False
+        cand_ret = cand_close.pct_change().iloc[-lookback:]
+
+        for pos in active_positions:
+            open_symbol = pos.get("Symbol")
+            open_side = pos.get("Side", "BUY")
+            if not open_symbol or open_symbol not in self.all_forecasts:
+                continue
+            open_df = self.all_forecasts.get(open_symbol)
+            if open_df is None or "Close" not in open_df.columns or date not in open_df.index:
+                continue
+
+            open_close = open_df.loc[:date, "Close"].dropna()
+            if len(open_close) < lookback + 5:
+                continue
+            open_ret = open_close.pct_change().iloc[-lookback:]
+
+            combined = pd.concat([cand_ret.rename("cand"), open_ret.rename("open")], axis=1).dropna()
+            if len(combined) < 20:
+                continue
+
+            corr = combined["cand"].corr(combined["open"])
+            if corr is None or not np.isfinite(corr):
+                continue
+
+            same_direction = str(candidate_side).upper() == str(open_side).upper()
+            is_risky = (corr > threshold and same_direction) or (
+                corr < -threshold and (not same_direction)
+            )
+            if is_risky:
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Random baseline

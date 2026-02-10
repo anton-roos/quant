@@ -137,7 +137,7 @@ def generate_signals(
                 pctile = float((atr_series < latest_atr).sum() / len(atr_series) * 100)
                 lo = config.get("ATR_PERCENTILE_LOW", 10)
                 hi = config.get("ATR_PERCENTILE_HIGH", 95)
-                if pctile < lo or pctile > hi:
+                if pctile < lo or pctile >= hi:
                     logger.debug(
                         f"  Skipping {mt5_name}: ATR percentile {pctile:.0f}% "
                         f"outside [{lo}, {hi}]"

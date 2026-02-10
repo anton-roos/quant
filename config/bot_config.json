@@ -8,8 +8,8 @@
     "FEATURES_PATH": "outputs/models/feature_cols.json",
     "SYMBOLS_PATH": "config/symbols.json",
 
-    "MIN_ACCEPTED": 0.50,
-    "STD_FACTOR": 1.0,
+    "MIN_ACCEPTED": 0.10,
+    "STD_FACTOR": 0.5,
     "MC_DROPOUT_SAMPLES": 50,
     "WINDOW_SIZE": 90,
 
@@ -32,8 +32,11 @@
     "GLOBAL_MAX_RISK_PCT": 5.0,
     "DEFAULT_LOT_SIZE": 0.01,
     "MAX_LOT_SIZE": 1.0,
-    "ATR_SL_MULTIPLIER": 2.0,
-    "ATR_TP_MULTIPLIER": 3.0,
+    "ATR_SL_MULTIPLIER": 1.0,
+    "ATR_TP_MULTIPLIER": 1.5,
+    "HORIZON_SL_SCALE": {"1d": 0.5, "1w": 1.0, "1m": 2.0, "6m": 4.0},
+    "HORIZON_TP_SCALE": {"1d": 0.5, "1w": 1.0, "1m": 2.0, "6m": 4.0},
+    "HORIZON_MAX_HOLD_HOURS": {"1d": 36, "1w": 168, "1m": 720, "6m": 4320},
     "MAX_DRAWDOWN_PCT": 15.0,
 
     "CORRELATION_THRESHOLD": 0.7,
@@ -42,6 +45,8 @@
     "TRAILING_STOP_ENABLED": true,
     "BREAKEVEN_AFTER_R": 1.0,
     "TRAILING_ATR_MULTIPLIER": 1.5,
+
+    "SIGNAL_REVERSAL_MARGIN": 0.04,
 
     "MAX_SPREAD_ATR_RATIO": 0.15,
 
@@ -69,5 +74,5 @@
 
     "CHECK_INTERVAL_SECONDS": 300,
     "DAILY_REFRESH_HOUR": 0,
-    "POSITION_REVIEW_HOURS": 24
+    "POSITION_REVIEW_HOURS": 48
 }
