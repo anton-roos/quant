@@ -95,6 +95,8 @@ DEFAULT_CONFIG = {
 
     # Strategy parameters (must match backtest)
     "MIN_ACCEPTED": 0.50,
+    "MIN_ACCEPTED_BUY": 0.10,   # Separate threshold for BUY signals
+    "MIN_ACCEPTED_SELL": 0.05,  # Separate threshold for SELL signals
     "STD_FACTOR": 1.0,
     "MC_DROPOUT_SAMPLES": 50,
     "WINDOW_SIZE": 90,
@@ -534,7 +536,9 @@ class TradingBot:
                 pred_std = float(std_probs[0, i])
                 adj_prob = pred_prob - self.config["STD_FACTOR"] * pred_std
 
-                if adj_prob > self.config["MIN_ACCEPTED"]:
+                # Use separate threshold for BUY signals (fallback to MIN_ACCEPTED for backward compat)
+                min_threshold_buy = self.config.get("MIN_ACCEPTED_BUY", self.config["MIN_ACCEPTED"])
+                if adj_prob > min_threshold_buy:
                     candidates.append({
                         "symbol": safe_name,
                         "mt5_name": mt5_name,
@@ -558,7 +562,9 @@ class TradingBot:
 
                 sym_best_adj = max(sym_best_adj, adj_prob, adj_prob_down)
 
-                if adj_prob_down > self.config["MIN_ACCEPTED"]:
+                # Use separate threshold for SELL signals (fallback to MIN_ACCEPTED for backward compat)
+                min_threshold_sell = self.config.get("MIN_ACCEPTED_SELL", self.config["MIN_ACCEPTED"])
+                if adj_prob_down > min_threshold_sell:
                     candidates.append({
                         "symbol": safe_name,
                         "mt5_name": mt5_name,
@@ -579,17 +585,19 @@ class TradingBot:
 
         # --- Diagnostic summary ---
         total_syms = len(self.symbols)
+        min_buy = self.config.get("MIN_ACCEPTED_BUY", self.config["MIN_ACCEPTED"])
+        min_sell = self.config.get("MIN_ACCEPTED_SELL", self.config["MIN_ACCEPTED"])
         logger.info(
             f"Signal diagnostics: {total_syms} symbols | "
             f"{diag_no_data} no-data | {diag_vol_filtered} vol-filtered | "
             f"{diag_evaluated} evaluated | {diag_below_threshold} horizon-checks below threshold"
         )
+        logger.info(f"Thresholds: BUY>={min_buy:.3f}, SELL>={min_sell:.3f}")
         if diag_best_adj:
             # Show top 5 symbols closest to passing threshold
-            min_accepted = self.config["MIN_ACCEPTED"]
             top5 = sorted(diag_best_adj.items(), key=lambda x: x[1], reverse=True)[:5]
             logger.info(
-                f"Top adj_prob vs threshold ({min_accepted}): "
+                f"Top adj_prob vs BUY threshold ({min_buy:.3f}): "
                 + ", ".join(f"{name}={val:.4f}" for name, val in top5)
             )
 

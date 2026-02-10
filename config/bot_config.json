@@ -9,6 +9,8 @@
     "SYMBOLS_PATH": "config/symbols.json",
 
     "MIN_ACCEPTED": 0.10,
+    "MIN_ACCEPTED_BUY": 0.10,
+    "MIN_ACCEPTED_SELL": 0.05,
     "STD_FACTOR": 0.5,
     "MC_DROPOUT_SAMPLES": 50,
     "WINDOW_SIZE": 90,
