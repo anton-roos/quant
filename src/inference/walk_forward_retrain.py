@@ -265,8 +265,6 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
         verbose=1,
     )
 
-    CONFIG["CACHE_DIR"] = orig_cache  # restore
-
     # ------------------------------------------------------------------
     # 6. Compare new vs old model
     # ------------------------------------------------------------------
@@ -295,6 +293,8 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
     else:
         logger.info("No existing model found — deploying new model.")
         deployed = True
+
+    CONFIG["CACHE_DIR"] = orig_cache  # restore
 
     # ------------------------------------------------------------------
     # 7. Deploy if better

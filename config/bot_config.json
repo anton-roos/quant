@@ -30,7 +30,7 @@
         "Crypto": 0.5,
         "Commodity": 1.0
     },
-    "GLOBAL_MAX_SLOTS": 5,
+    "GLOBAL_MAX_SLOTS": 8,
     "GLOBAL_MAX_RISK_PCT": 5.0,
     "DEFAULT_LOT_SIZE": 0.01,
     "MAX_LOT_SIZE": 1.0,
@@ -76,5 +76,5 @@
 
     "CHECK_INTERVAL_SECONDS": 300,
     "DAILY_REFRESH_HOUR": 0,
-    "POSITION_REVIEW_HOURS": 48
+    "POSITION_REVIEW_HOURS": 72
 }
