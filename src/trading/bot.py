@@ -675,19 +675,24 @@ class TradingBot:
             return 1.0
 
     def _compute_lot_size(self, symbol_info: Dict, atr: float, close: float,
-                          candidate_type: str = "Forex") -> float:
+                          candidate_type: str = "Forex",
+                          horizon: str = "1w") -> float:
         """Compute position size based on risk % of equity and ATR-based stop.
         
         Converts the SL distance into account-currency risk using the profit
         currency exchange rate, so cross-currency pairs (e.g. GBPJPY on a USD
         account) are sized correctly.
+        
+        The SL distance includes horizon scaling so that lot size matches the
+        actual stop-loss placed on the order.
         """
         try:
             acct = self.mt5.account_info()
             equity = acct["equity"]
             risk_amount = equity * (self.config["RISK_PER_TRADE_PCT"] / 100.0)
 
-            sl_distance = atr * self.config["ATR_SL_MULTIPLIER"]
+            sl_scale = self.config.get("HORIZON_SL_SCALE", {}).get(horizon, 1.0)
+            sl_distance = atr * self.config["ATR_SL_MULTIPLIER"] * sl_scale
             if sl_distance <= 0:
                 return self.config["DEFAULT_LOT_SIZE"]
 
@@ -1339,7 +1344,8 @@ class TradingBot:
 
             # Compute lot size
             lot_size = self._compute_lot_size(sym_info, atr, live_price,
-                                              candidate_type=candidate.get("type", "Forex"))
+                                              candidate_type=candidate.get("type", "Forex"),
+                                              horizon=candidate["horizon"])
 
             # Comment with signal info
             comment = f"bot:{candidate['horizon']}:{candidate['adj_prob']:.2f}"

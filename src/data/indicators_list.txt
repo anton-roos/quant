@@ -36,6 +36,13 @@ momentum_5d - 5-day price momentum (% return)
 momentum_20d - 20-day price momentum (% return)
 skew_5d - 5-day price skewness, measuring asymmetry in return distribution
 intraday_range - The difference between the day's high and low prices (normalized by close)
+ADX - Average Directional Index (14-day), measures trend strength regardless of direction (0-100)
+Stoch_K - Stochastic %K oscillator (14-day), overbought/oversold momentum indicator (0-100)
+Stoch_D - Stochastic %D (3-day SMA of %K), signal line for stochastic crossovers
+vol_ratio_5_20 - Ratio of 5-day to 20-day volatility; >1 signals short-term vol spike / regime shift
+CLV - Close Location Value, where price closed within the day's range (-1 to +1), buying/selling pressure proxy
+corr_SP500_20d - 20-day rolling correlation of instrument returns with S&P 500 (dynamic risk-on/off)
+corr_SP500_60d - 60-day rolling correlation of instrument returns with S&P 500 (longer-term regime)
 
 # Notes:
 # - Volume indicators (OBV, abnormal_vol) are set to 0 for forex pairs (volume not meaningful)

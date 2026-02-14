@@ -4,19 +4,19 @@
     "MAGIC": 24001,
 
     "MODEL_PATH": "outputs/models/lstm_model.keras",
-    "SCALER_PATH": "outputs/models/scaler.pkl",
+    "SCALER_PATH": "outputs/models/scaler.joblib",
     "FEATURES_PATH": "outputs/models/feature_cols.json",
     "SYMBOLS_PATH": "config/symbols.json",
 
-    "MIN_ACCEPTED": 0.10,
-    "MIN_ACCEPTED_BUY": 0.10,
-    "MIN_ACCEPTED_SELL": 0.05,
+    "MIN_ACCEPTED": 0.50,
+    "MIN_ACCEPTED_BUY": 0.50,
+    "MIN_ACCEPTED_SELL": 0.50,
     "STD_FACTOR": 0.5,
     "MC_DROPOUT_SAMPLES": 50,
     "WINDOW_SIZE": 90,
 
     "MAX_CONCURRENT_POSITIONS": 3,
-    "RISK_PER_TRADE_PCT": 1.0,
+    "RISK_PER_TRADE_PCT": 0.5,
 
     "SLOTS_PER_TYPE": {
         "Index": 2,
@@ -35,11 +35,11 @@
     "DEFAULT_LOT_SIZE": 0.01,
     "MAX_LOT_SIZE": 1.0,
     "ATR_SL_MULTIPLIER": 1.0,
-    "ATR_TP_MULTIPLIER": 1.5,
+    "ATR_TP_MULTIPLIER": 2.0,
     "HORIZON_SL_SCALE": {"1d": 0.5, "1w": 1.0, "1m": 2.0, "6m": 4.0},
     "HORIZON_TP_SCALE": {"1d": 0.5, "1w": 1.0, "1m": 2.0, "6m": 4.0},
     "HORIZON_MAX_HOLD_HOURS": {"1d": 36, "1w": 168, "1m": 720, "6m": 4320},
-    "MAX_DRAWDOWN_PCT": 15.0,
+    "MAX_DRAWDOWN_PCT": 20.0,
 
     "CORRELATION_THRESHOLD": 0.7,
     "CORRELATION_LOOKBACK": 60,

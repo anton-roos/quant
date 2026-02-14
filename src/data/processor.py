@@ -6,7 +6,9 @@ Supports: Forex pairs, Indices, Commodities, and Crypto.
 
 Features include:
   - Basic OHLCV-derived (log returns, MAs, EMA, RSI, MACD, Bollinger, etc.)
-  - Cross-asset / inter-market features (Gold, DXY-proxy, S&P500 returns)
+  - Trend strength (ADX), Stochastic oscillator (%K/%D), Close Location Value
+  - Volatility ratio (5d/20d), rolling correlation with S&P 500
+  - Cross-asset / inter-market features (Gold, DXY-proxy, S&P500, BTC, Oil)
   - Market regime detection (rolling Sharpe, volatility regime, trend regime)
   - Calendar & seasonality features
 """
@@ -109,6 +111,16 @@ def add_cross_asset_features(df, cross_assets):
     # backward-fill from leaking future data into earlier rows.
     xa_cols = [c for c in df.columns if c.startswith("XA_")]
     df[xa_cols] = df[xa_cols].ffill().fillna(0)
+
+    # ==== Rolling correlation with S&P 500 (dynamic risk-on/off) ====
+    if "XA_SP500_ret_1d" in df.columns:
+        inst_ret = df["close"].pct_change()
+        df["corr_SP500_20d"] = inst_ret.rolling(20).corr(df["XA_SP500_ret_1d"])
+        df["corr_SP500_60d"] = inst_ret.rolling(60).corr(df["XA_SP500_ret_1d"])
+    else:
+        df["corr_SP500_20d"] = 0.0
+        df["corr_SP500_60d"] = 0.0
+
     return df
 
 
@@ -259,6 +271,37 @@ def process_file(csv_path, output_path):
     df['skew_5d'] = df['close'].pct_change().rolling(5).skew()
     #Intraday change
     df['intraday_range'] = (df['high'] - df['low']) / df['close']
+
+    # ==== ADX (Average Directional Index) — trend strength ====
+    plus_dm = df['high'].diff()
+    minus_dm = -df['low'].diff()
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > pd.Series(plus_dm)) & (minus_dm > 0), minus_dm, 0.0)
+    _tr = pd.DataFrame({
+        'hl': df['high'] - df['low'],
+        'hc': (df['high'] - df['close'].shift(1)).abs(),
+        'lc': (df['low'] - df['close'].shift(1)).abs(),
+    }).max(axis=1)
+    atr_14_adx = _tr.rolling(14).mean()
+    plus_di = 100 * pd.Series(plus_dm).rolling(14).mean() / atr_14_adx
+    minus_di = 100 * pd.Series(minus_dm).rolling(14).mean() / atr_14_adx
+    dx = (plus_di - minus_di).abs() / (plus_di + minus_di) * 100
+    df['ADX'] = dx.rolling(14).mean()
+
+    # ==== Stochastic Oscillator %K / %D ====
+    _low14 = df['low'].rolling(14).min()
+    _high14 = df['high'].rolling(14).max()
+    df['Stoch_K'] = 100 * (df['close'] - _low14) / (_high14 - _low14)
+    df['Stoch_D'] = df['Stoch_K'].rolling(3).mean()
+
+    # ==== Volatility ratio (short / long) — regime shift detector ====
+    df['vol_ratio_5_20'] = df['volatility_5d'] / df['volatility_20d']
+
+    # ==== Close Location Value — buying/selling pressure proxy ====
+    _hl_range = df['high'] - df['low']
+    df['CLV'] = np.where(_hl_range > 0,
+                         (2 * df['close'] - df['low'] - df['high']) / _hl_range,
+                         0.0)
 
     # ==== REGIME DETECTION FEATURES ====
     df = add_regime_features(df)
