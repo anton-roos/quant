@@ -110,7 +110,6 @@ def _build_bot(tmp_workspace, config_overrides=None):
         "NOTIFY_WEBHOOK_URL": "",
         "WINDOW_SIZE": 10,
         "MC_DROPOUT_SAMPLES": 3,
-        "MAX_CONCURRENT_POSITIONS": 3,
         "VOLATILITY_FILTER_ENABLED": False,
         "CLOSE_BEFORE_WEEKEND": False,
         "RETRAIN_ENABLED": False,

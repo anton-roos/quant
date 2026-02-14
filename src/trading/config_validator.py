@@ -19,7 +19,6 @@ _NUMERIC_RULES: List[Tuple[str, type, float, float, str]] = [
     ("STD_FACTOR", (int, float), 0.0, 10.0, "Uncertainty penalty factor"),
     ("MC_DROPOUT_SAMPLES", int, 1, 500, "MC Dropout samples"),
     ("WINDOW_SIZE", int, 10, 500, "Look-back window size"),
-    ("MAX_CONCURRENT_POSITIONS", int, 1, 20, "Max concurrent positions"),
     ("RISK_PER_TRADE_PCT", (int, float), 0.01, 5.0, "Risk per trade (%)"),
     ("DEFAULT_LOT_SIZE", (int, float), 0.001, 10.0, "Default lot size"),
     ("MAX_LOT_SIZE", (int, float), 0.01, 100.0, "Maximum lot size"),
@@ -64,7 +63,7 @@ _REQUIRED_KEYS = [
     "MT5_HOST", "MT5_PORT", "MAGIC",
     "MODEL_PATH", "SCALER_PATH", "FEATURES_PATH", "SYMBOLS_PATH",
     "MIN_ACCEPTED", "WINDOW_SIZE", "MC_DROPOUT_SAMPLES",
-    "MAX_CONCURRENT_POSITIONS", "RISK_PER_TRADE_PCT",
+    "RISK_PER_TRADE_PCT",
     "ATR_SL_MULTIPLIER", "ATR_TP_MULTIPLIER", "MAX_DRAWDOWN_PCT",
 ]
 

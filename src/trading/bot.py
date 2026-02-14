@@ -102,7 +102,6 @@ DEFAULT_CONFIG = {
     "WINDOW_SIZE": 90,
 
     # Risk management
-    "MAX_CONCURRENT_POSITIONS": 3,       # Legacy: global cap (now use GLOBAL_MAX_SLOTS)
     "RISK_PER_TRADE_PCT": 1.0,         # Default % of equity risked per trade
     "DEFAULT_LOT_SIZE": 0.01,          # Fallback if sizing calc fails
     "MAX_LOT_SIZE": 1.0,               # Hard cap

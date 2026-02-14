@@ -79,17 +79,27 @@ class BotConfig:
 
     # Strategy parameters
     MIN_ACCEPTED: float = 0.50
+    MIN_ACCEPTED_BUY: float = 0.10
+    MIN_ACCEPTED_SELL: float = 0.05
     STD_FACTOR: float = 1.0
     MC_DROPOUT_SAMPLES: int = 50
     WINDOW_SIZE: int = 90
 
     # Risk management
-    MAX_CONCURRENT_POSITIONS: int = 3
     RISK_PER_TRADE_PCT: float = 1.0
     DEFAULT_LOT_SIZE: float = 0.01
     MAX_LOT_SIZE: float = 1.0
     ATR_SL_MULTIPLIER: float = 2.0
     ATR_TP_MULTIPLIER: float = 3.0
+    HORIZON_SL_SCALE: Dict[str, float] = field(
+        default_factory=lambda: {"1d": 0.5, "1w": 1.0, "1m": 2.0, "6m": 4.0}
+    )
+    HORIZON_TP_SCALE: Dict[str, float] = field(
+        default_factory=lambda: {"1d": 0.5, "1w": 1.0, "1m": 2.0, "6m": 4.0}
+    )
+    HORIZON_MAX_HOLD_HOURS: Dict[str, int] = field(
+        default_factory=lambda: {"1d": 36, "1w": 168, "1m": 720, "6m": 4320}
+    )
     MAX_DRAWDOWN_PCT: float = 15.0
 
     # Per-instrument-type slot allocation
@@ -110,6 +120,9 @@ class BotConfig:
     TRAILING_STOP_ENABLED: bool = True
     BREAKEVEN_AFTER_R: float = 1.0
     TRAILING_ATR_MULTIPLIER: float = 1.5
+
+    # Signal reversal exit
+    SIGNAL_REVERSAL_MARGIN: float = 0.04
 
     # Spread / liquidity gate
     MAX_SPREAD_ATR_RATIO: float = 0.15
@@ -138,6 +151,9 @@ class BotConfig:
     NOTIFY_ON_TRADE: bool = True
     NOTIFY_ON_DRAWDOWN: bool = True
     NOTIFY_ON_ERROR: bool = True
+
+    # Bridge logging
+    BRIDGE_LOG_DIR: str = "outputs/bridge_logs"
 
     # State persistence
     STATE_FILE: str = "outputs/bot_state.json"

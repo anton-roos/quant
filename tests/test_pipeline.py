@@ -224,7 +224,6 @@ class TestConfigValidator:
             "STD_FACTOR": 1.0,
             "MC_DROPOUT_SAMPLES": 30,
             "WINDOW_SIZE": 90,
-            "MAX_CONCURRENT_POSITIONS": 3,
             "RISK_PER_TRADE_PCT": 1.0,
             "DEFAULT_LOT_SIZE": 0.01,
             "MAX_LOT_SIZE": 1.0,
@@ -268,9 +267,9 @@ class TestConfigValidator:
     def test_wrong_type_detected(self):
         from src.trading.config_validator import validate_config
         cfg = self._base_config()
-        cfg["MAX_CONCURRENT_POSITIONS"] = "three"  # Should be int
+        cfg["RISK_PER_TRADE_PCT"] = "one"  # Should be numeric
         errors = validate_config(cfg)
-        assert any("MAX_CONCURRENT_POSITIONS" in e for e in errors)
+        assert any("RISK_PER_TRADE_PCT" in e for e in errors)
 
     def test_atr_sl_tp_cross_validation(self):
         from src.trading.config_validator import validate_config

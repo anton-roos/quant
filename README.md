@@ -431,7 +431,6 @@ LSTM_AI_Stock_Predictor/
 | `MAGIC` | `24001` | EA magic number for order identification |
 | `MIN_ACCEPTED` | `0.50` | Minimum adjusted probability to open a trade |
 | `STD_FACTOR` | `1.0` | Uncertainty penalty: `adj_prob = raw_prob − STD_FACTOR × std` |
-| `MAX_CONCURRENT_POSITIONS` | `3` | Legacy max open positions (see slot manager) |
 | `RISK_PER_TRADE_PCT` | `1.0` | Default risk per trade as % of equity |
 | `GLOBAL_MAX_SLOTS` | `5` | Maximum simultaneous open positions across all types |
 | `GLOBAL_MAX_RISK_PCT` | `5.0` | Maximum total portfolio risk (%) |
