@@ -40,7 +40,7 @@ from keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from keras.metrics import AUC
 from sklearn.preprocessing import StandardScaler
 
-from src.models.layers import MCDropout
+from src.models.layers import MCDropout, binary_focal_loss
 from src.models.lstm import build_model
 from src.models.context import PipelineContext
 from src.utils.constants import HORIZONS, EXCLUDED_COLS
@@ -194,10 +194,17 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
     logger.info(f"Scaler fitted on {X_all.shape[0]} rows, {n_features} features")
 
     # ------------------------------------------------------------------
-    # 3. Compute thresholds from training data
+    # 3. Compute thresholds from training data (PER-SYMBOL)
     # ------------------------------------------------------------------
+    _sf = CONFIG.get("SIGMA_FACTOR", 1.5)
+    per_symbol_thresholds = {}
+    symbol_ids = {}
     all_targets = {f"Target_{h}": [] for h in HORIZONS}
-    for csv_path in all_csvs:
+
+    for idx, csv_path in enumerate(all_csvs):
+        symbol_stem = Path(csv_path).stem
+        symbol_ids[symbol_stem] = idx
+
         df = pd.read_csv(csv_path, parse_dates=["date"]).sort_values("date").dropna()
         df = add_features(df)
         if df.empty:
@@ -208,12 +215,29 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
         for h in HORIZONS:
             all_targets[f"Target_{h}"].append(train_rows[f"Target_{h}"].values)
 
+        if len(train_rows) >= 50:
+            sym_up, sym_down = {}, {}
+            for h in HORIZONS:
+                vals = train_rows[f"Target_{h}"].dropna().values
+                mu, sig = np.nanmean(vals), np.nanstd(vals)
+                sym_up[h] = float(mu + _sf * sig)
+                sym_down[h] = float(mu - _sf * sig)
+            per_symbol_thresholds[symbol_stem] = {"up": sym_up, "down": sym_down}
+
+    # Global fallback
     thresholds_up, thresholds_down = {}, {}
     for h in HORIZONS:
         vals = np.concatenate(all_targets[f"Target_{h}"])
         mu, sig = np.nanmean(vals), np.nanstd(vals)
-        thresholds_up[h] = mu + 2 * sig
-        thresholds_down[h] = mu - 2 * sig
+        thresholds_up[h] = float(mu + _sf * sig)
+        thresholds_down[h] = float(mu - _sf * sig)
+
+    for csv_path in all_csvs:
+        s = Path(csv_path).stem
+        if s not in per_symbol_thresholds:
+            per_symbol_thresholds[s] = {"up": thresholds_up, "down": thresholds_down}
+
+    n_symbols = len(symbol_ids)
 
     # Build a PipelineContext for this retrain run (no global mutation)
     retrain_ctx = PipelineContext(
@@ -221,6 +245,8 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
         feature_cols=feature_cols,
         thresholds_up=thresholds_up,
         thresholds_down=thresholds_down,
+        per_symbol_thresholds=per_symbol_thresholds,
+        symbol_ids=symbol_ids,
     )
 
     # ------------------------------------------------------------------
@@ -245,14 +271,22 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
     orig_cache = CONFIG["CACHE_DIR"]
     CONFIG["CACHE_DIR"] = cache_bak
 
-    train_gen = InstrumentDataGenerator(all_csvs, batch_size=128, split="train", shuffle=True, use_time_weights=False)
-    val_gen = InstrumentDataGenerator(all_csvs, batch_size=128, split="val", shuffle=False)
+    train_gen = InstrumentDataGenerator(
+        all_csvs, batch_size=128, split="train", shuffle=True,
+        use_time_weights=True, decay_factor=0.002,
+        symbol_id_map=symbol_ids,
+    )
+    val_gen = InstrumentDataGenerator(
+        all_csvs, batch_size=128, split="val", shuffle=False,
+        symbol_id_map=symbol_ids,
+    )
 
     logger.info(f"Train batches: {len(train_gen)}, Val batches: {len(val_gen)}")
 
-    new_model = build_model(n_features, CONFIG["WINDOW_SIZE"])
+    new_model = build_model(n_features, CONFIG["WINDOW_SIZE"], n_symbols=n_symbols)
 
-    new_model.compile(optimizer="adam", loss="binary_crossentropy", metrics=[AUC(name="auc")])
+    focal_loss = binary_focal_loss(gamma=2.0, alpha=0.25)
+    new_model.compile(optimizer="adam", loss=focal_loss, metrics=[AUC(name="auc")])
 
     early_stop = EarlyStopping(patience=CONFIG.get("EARLY_STOP_PATIENCE", 30), monitor="val_loss", restore_best_weights=True, mode="min")
     reduce_lr = ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=CONFIG.get("REDUCE_LR_PATIENCE", 10), min_lr=1e-6, verbose=1)
@@ -304,7 +338,9 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
         archive_dir = CONFIG["MODEL_DIR"] / "archive"
         archive_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        for artifact in ["lstm_model.keras", "scaler.joblib", "scaler.pkl", "feature_cols.json", "feature_hash.txt", "thresholds.json"]:
+        for artifact in ["lstm_model.keras", "scaler.joblib", "scaler.pkl", "feature_cols.json",
+                         "feature_hash.txt", "thresholds.json", "symbol_ids.json",
+                         "per_symbol_thresholds.json"]:
             src = CONFIG["MODEL_DIR"] / artifact
             if src.exists():
                 shutil.copy2(src, archive_dir / f"{ts}_{artifact}")
@@ -319,6 +355,10 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
             f.write(feature_hash)
         with open(CONFIG["MODEL_DIR"] / "thresholds.json", "w") as f:
             json.dump({"thresholds_up": thresholds_up, "thresholds_down": thresholds_down}, f, indent=2)
+        with open(CONFIG["MODEL_DIR"] / "symbol_ids.json", "w") as f:
+            json.dump(symbol_ids, f, indent=2)
+        with open(CONFIG["MODEL_DIR"] / "per_symbol_thresholds.json", "w") as f:
+            json.dump(per_symbol_thresholds, f, indent=2)
 
         logger.info(f"New model deployed. Feature hash: {feature_hash}")
 

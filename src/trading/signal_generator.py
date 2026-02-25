@@ -78,9 +78,17 @@ def prepare_features(
     return X, df
 
 
-def mc_predict(model_fn, X: np.ndarray, n_samples: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Run MC-Dropout inference and return ``(mean_probs, std_probs)``."""
-    preds = np.array([model_fn(X).numpy() for _ in range(n_samples)])
+def mc_predict(model_fn, X: np.ndarray, n_samples: int, symbol_id: int = None) -> Tuple[np.ndarray, np.ndarray]:
+    """Run MC-Dropout inference and return ``(mean_probs, std_probs)``.
+
+    When ``symbol_id`` is not None the model is called with multi-input
+    ``(X, sym_ids)`` to leverage the learned symbol embedding.
+    """
+    if symbol_id is not None:
+        sym_ids = np.array([[symbol_id]], dtype=np.int32)
+        preds = np.array([model_fn(X, sym_ids).numpy() for _ in range(n_samples)])
+    else:
+        preds = np.array([model_fn(X).numpy() for _ in range(n_samples)])
     return preds.mean(axis=0), preds.std(axis=0)
 
 
@@ -97,17 +105,25 @@ def generate_signals(
     feature_cols: List[str],
     cycle_cache: Dict[str, Optional[pd.DataFrame]],
     processed_base: Path,
+    symbol_ids: Optional[Dict[str, int]] = None,
 ) -> List[Dict]:
     """Scan all instruments and return ranked trade candidates.
 
     Each candidate dict contains: symbol, mt5_name, side, horizon,
     horizon_days, pred_prob, pred_std, adj_prob, close, atr, type,
     weighted_score.
+
+    Parameters
+    ----------
+    symbol_ids : dict, optional
+        Mapping from symbol stem (e.g. ``EURUSD_daily_processed``) to
+        integer ID for the model's embedding input.
     """
     candidates: List[Dict] = []
     n_horizons = len(HORIZONS)
     window_size = config["WINDOW_SIZE"]
     mc_samples = config["MC_DROPOUT_SAMPLES"]
+    _symbol_ids = symbol_ids or {}
 
     for sym in symbols:
         mt5_name = sym["name"]
@@ -120,7 +136,9 @@ def generate_signals(
             continue
 
         X, df = result
-        mean_probs, std_probs = mc_predict(model_fn, X, mc_samples)
+        sym_stem = f"{safe_name}_daily_processed"
+        sym_id = _symbol_ids.get(sym_stem, None)
+        mean_probs, std_probs = mc_predict(model_fn, X, mc_samples, symbol_id=sym_id)
 
         latest_close = float(df["close"].iloc[-1])
         latest_atr = (
@@ -150,7 +168,8 @@ def generate_signals(
             pred_std = float(std_probs[0, i])
             adj_prob = pred_prob - config["STD_FACTOR"] * pred_std
 
-            if adj_prob > config["MIN_ACCEPTED"]:
+            min_buy = config.get("MIN_ACCEPTED_BUY", config["MIN_ACCEPTED"])
+            if adj_prob > min_buy:
                 candidates.append(_candidate(
                     safe_name, mt5_name, "BUY", h, HORIZON_DAYS[h],
                     pred_prob, pred_std, adj_prob, latest_close, latest_atr, sym,
@@ -161,7 +180,8 @@ def generate_signals(
             pred_std_down = float(std_probs[0, n_horizons + i])
             adj_prob_down = pred_prob_down - config["STD_FACTOR"] * pred_std_down
 
-            if adj_prob_down > config["MIN_ACCEPTED"]:
+            min_sell = config.get("MIN_ACCEPTED_SELL", config["MIN_ACCEPTED"])
+            if adj_prob_down > min_sell:
                 candidates.append(_candidate(
                     safe_name, mt5_name, "SELL", h, HORIZON_DAYS[h],
                     pred_prob_down, pred_std_down, adj_prob_down,

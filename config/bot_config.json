@@ -8,10 +8,10 @@
     "FEATURES_PATH": "outputs/models/feature_cols.json",
     "SYMBOLS_PATH": "config/symbols.json",
 
-    "MIN_ACCEPTED": 0.50,
-    "MIN_ACCEPTED_BUY": 0.50,
-    "MIN_ACCEPTED_SELL": 0.50,
-    "STD_FACTOR": 0.5,
+    "MIN_ACCEPTED": 0.10,
+    "MIN_ACCEPTED_BUY": 0.10,
+    "MIN_ACCEPTED_SELL": 0.04,
+    "STD_FACTOR": 0.25,
     "MC_DROPOUT_SAMPLES": 50,
     "WINDOW_SIZE": 90,
 
@@ -55,14 +55,21 @@
     "FRIDAY_CLOSE_HOUR_UTC": 20,
 
     "VOLATILITY_FILTER_ENABLED": true,
-    "ATR_PERCENTILE_LOW": 10,
-    "ATR_PERCENTILE_HIGH": 95,
+    "ATR_PERCENTILE_LOW": 5,
+    "ATR_PERCENTILE_HIGH": 98,
     "ATR_PERCENTILE_LOOKBACK": 252,
 
     "HORIZON_WEIGHTS": {"1d": 1.5, "1w": 1.2, "1m": 1.0, "6m": 0.6},
 
     "RETRAIN_ENABLED": true,
     "RETRAIN_INTERVAL_DAYS": 30,
+
+    "SENTIMENT_ENABLED": true,
+    "BRAVE_API_KEY": "BSAaSDnxjd-014RpH9Kerpjr16wJODa",
+    "GEMINI_API_KEY": "AQ.Ab8RN6LbgfimEtMnD92hc0aZ6DsN8L8pRkdnS1dHib2U0imGCA",
+    "GEMINI_API_ENDPOINT": "https://aiplatform.googleapis.com/v1/publishers/google/models/{MODEL}:generateContent?key={API_KEY}",
+    "GEMINI_MODEL": "gemini-2.5-flash-lite",
+    "CONFIDENCE_SCORE_WEIGHT": 0.3,
 
     "NOTIFY_WEBHOOK_URL": "",
     "NOTIFY_ON_TRADE": true,

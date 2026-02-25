@@ -176,6 +176,18 @@ def process_file(csv_path, output_path):
     df = pd.read_csv(csv_path, parse_dates=["date"])
     df = df.sort_values("date").reset_index(drop=True)
 
+    # === Merge sentiment features (Brave Search + LLM) ===
+    try:
+        from src.data.features.sentiment_features import merge_sentiment_features
+        symbol = Path(csv_path).stem.replace("_daily", "")
+        df = merge_sentiment_features(df, symbol)
+    except Exception as e:
+        # If sentiment data is missing or fails, add zero columns
+        for _sc in ["sentiment_combined", "sentiment_heuristic", "sentiment_llm",
+                     "sentiment_llm_conf", "sentiment_headline_count",
+                     "sentiment_ma3", "sentiment_ma7", "sentiment_momentum"]:
+            df[_sc] = 0.0
+
     df["YesterdayClose"] = df["close"].shift(1)
     df["YesterdayOpenLogR"]  = np.log(df["open"] / df["open"].shift(1))
     df["YesterdayHighLogR"]  = np.log(df["high"] / df["high"].shift(1))

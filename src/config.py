@@ -36,8 +36,9 @@ class TrainingConfig:
     VAL_FRAC_WITHIN_TRAIN: float = 0.2
     MC_DROPOUT_SAMPLES: int = 50
     PROB_THRESHOLD: float = 0.7
+    SIGMA_FACTOR: float = 1.5
 
-    MIN_VAL_AUC: float = 0.55
+    MIN_VAL_AUC: float = 0.62
     BATCH_SIZE: int = 128
     MAX_EPOCHS: int = 500
     EARLY_STOP_PATIENCE: int = 15
@@ -154,6 +155,16 @@ class BotConfig:
 
     # Bridge logging
     BRIDGE_LOG_DIR: str = "outputs/bridge_logs"
+
+    # Sentiment & Gemini LLM
+    SENTIMENT_ENABLED: bool = False
+    BRAVE_API_KEY: str = ""
+    GEMINI_API_KEY: str = ""
+    GEMINI_API_ENDPOINT: str = ""
+    GEMINI_MODEL: str = "gemini-2.5-flash-lite"
+
+    # Confidence scoring
+    CONFIDENCE_SCORE_WEIGHT: float = 0.3
 
     # State persistence
     STATE_FILE: str = "outputs/bot_state.json"

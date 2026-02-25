@@ -38,7 +38,9 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # Suppress TF info logs
 import tensorflow as tf
 from keras.models import load_model
 
-from src.models.layers import MCDropout
+from src.models.layers import MCDropout, binary_focal_loss
+from src.models.calibration import load_calibrator, calibrate
+from src.models.uncertainty import composite_confidence, predictive_entropy
 from src.utils.constants import sanitize_filename, CATEGORY_TYPE_TO_FOLDER
 from src.utils.datetime_utils import parse_iso_datetime_to_utc
 from src.trading.mt5_client import MT5Client
@@ -159,6 +161,16 @@ DEFAULT_CONFIG = {
     # State persistence
     "STATE_FILE": "outputs/bot_state.json",
 
+    # Sentiment & Gemini LLM
+    "SENTIMENT_ENABLED": False,
+    "BRAVE_API_KEY": "",
+    "GEMINI_API_KEY": "",
+    "GEMINI_API_ENDPOINT": "",
+    "GEMINI_MODEL": "gemini-2.5-flash-lite",
+
+    # Confidence scoring
+    "CONFIDENCE_SCORE_WEIGHT": 0.3,    # How much composite confidence boosts weighted_score
+
     # Scheduling
     "CHECK_INTERVAL_SECONDS": 300,     # 5 minutes between cycles
     "DAILY_REFRESH_HOUR": 0,           # Hour (UTC) to refresh candles & reprocess
@@ -210,11 +222,15 @@ class TradingBot:
         self.model = None
         self.scaler = None
         self.feature_cols: List[str] = []
+        self.symbol_ids: Dict[str, int] = {}   # symbol_stem -> int ID for embedding
         self.symbols: List[Dict] = []          # From symbols.json
         self.symbol_name_map: Dict[str, str] = {}  # sanitized_name -> MT5 name
 
         self._load_artifacts()
         self._load_symbols()
+
+        # Calibrator (Platt / Isotonic — loaded if available)
+        self.calibrator = load_calibrator()
 
         # Trade journal
         self.journal = TradeJournal()
@@ -225,8 +241,19 @@ class TradingBot:
         # Restore persisted state (drawdown tracking, last refresh, etc.)
         self._load_state()
 
-        # Compile MC prediction as tf.function for speed
-        self._mc_predict_fn = tf.function(lambda x: self.model(x, training=True))
+        # Compile MC prediction as tf.function for speed.
+        # The model may be single-input or multi-input (with symbol embedding).
+        self._model_has_symbol_input = len(self.model.inputs) > 1
+        if self._model_has_symbol_input:
+            @tf.function
+            def _mc_fn(ts_input, sym_input):
+                return self.model([ts_input, sym_input], training=True)
+            self._mc_predict_fn = _mc_fn
+        else:
+            self._mc_predict_fn = tf.function(lambda x: self.model(x, training=True))
+
+        # Live confidence tracker
+        self._confidence_log: List[Dict] = []
 
     # ------------------------------------------------------------------
     # Artifact loading
@@ -248,7 +275,8 @@ class TradingBot:
             raise FileNotFoundError(f"Feature cols not found at {features_path}")
 
         logger.info("Loading model...")
-        self.model = load_model(model_path, custom_objects={"MCDropout": MCDropout})
+        focal_loss = binary_focal_loss(gamma=2.0, alpha=0.25)
+        self.model = load_model(model_path, custom_objects={"MCDropout": MCDropout, "binary_focal_loss": focal_loss})
         logger.info(f"Model loaded: {model_path}")
 
         # Try joblib first, fall back to pickle for legacy scaler.pkl files
@@ -269,6 +297,16 @@ class TradingBot:
         with open(features_path, "r") as f:
             self.feature_cols = json.load(f)
         logger.info(f"Feature cols loaded: {len(self.feature_cols)} features")
+
+        # Load symbol-to-ID mapping for the embedding input (if available)
+        symbol_ids_path = PROJECT_ROOT / "outputs" / "models" / "symbol_ids.json"
+        if symbol_ids_path.exists():
+            with open(symbol_ids_path, "r") as f:
+                self.symbol_ids = json.load(f)
+            logger.info(f"Symbol IDs loaded: {len(self.symbol_ids)} symbols")
+        else:
+            self.symbol_ids = {}
+            logger.info("No symbol_ids.json found — model will run without symbol embedding")
 
         # Verify feature hash matches saved model artifacts (detect processor changes)
         feature_hash_path = PROJECT_ROOT / "outputs" / "models" / "feature_hash.txt"
@@ -408,6 +446,35 @@ class TradingBot:
                     logger.error(f"Failed to process {csv_file.name}: {e}")
 
         self.last_refresh_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        # Refresh sentiment data if Brave API key is configured
+        if self.config.get("SENTIMENT_ENABLED", False):
+            try:
+                from src.data.sentiment_ingest import ingest_sentiment
+                brave_key = self.config.get("BRAVE_API_KEY") or os.environ.get("BRAVE_API_KEY", "")
+                gemini_key = self.config.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
+                if brave_key:
+                    symbol_names = [s["name"] for s in self.symbols]
+                    logger.info(f"Refreshing sentiment data for {len(symbol_names)} symbols...")
+                    ingest_sentiment(
+                        symbols=symbol_names,
+                        brave_key=brave_key,
+                        gemini_key=gemini_key or None,
+                        gemini_endpoint=self.config.get("GEMINI_API_ENDPOINT", ""),
+                        gemini_model=self.config.get("GEMINI_MODEL", "gemini-2.5-flash-lite"),
+                    )
+                    # Invalidate cached sentiment features so processor picks up fresh data
+                    try:
+                        from src.data.features.sentiment_features import invalidate_sentiment_cache
+                        invalidate_sentiment_cache()
+                    except ImportError:
+                        pass
+                    logger.info("Sentiment refresh complete")
+                else:
+                    logger.info("SENTIMENT_ENABLED=True but no BRAVE_API_KEY — skipping sentiment")
+            except Exception as e:
+                logger.error(f"Sentiment refresh failed: {e}")
+
         logger.info("Data refresh complete")
 
     # ------------------------------------------------------------------
@@ -462,14 +529,68 @@ class TradingBot:
 
         return X, df
 
-    def _mc_predict(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _mc_predict(self, X: np.ndarray, symbol_id: int = 0) -> Tuple[np.ndarray, np.ndarray]:
         """Run MC Dropout inference and return (mean_probs, std_probs).
-        
+
+        If a calibrator is loaded, probabilities are calibrated.
         Uses tf.function-compiled forward pass for speed.
+
+        Parameters
+        ----------
+        X : ndarray, shape (1, window+1, n_features)
+        symbol_id : int
+            Integer ID for the symbol embedding input (ignored when
+            the model has no embedding layer).
         """
         n_samples = self.config["MC_DROPOUT_SAMPLES"]
-        preds = np.array([self._mc_predict_fn(X).numpy() for _ in range(n_samples)])
-        return preds.mean(axis=0), preds.std(axis=0)
+        if self._model_has_symbol_input:
+            sym_ids = np.array([[symbol_id]], dtype=np.int32)
+            preds = np.array([self._mc_predict_fn(X, sym_ids).numpy() for _ in range(n_samples)])
+        else:
+            preds = np.array([self._mc_predict_fn(X).numpy() for _ in range(n_samples)])
+        mean_probs = preds.mean(axis=0)
+        std_probs = preds.std(axis=0)
+
+        # Apply calibration if available
+        mean_probs = calibrate(self.calibrator, mean_probs)
+
+        return mean_probs, std_probs
+
+    def _compute_confidence(self, mean_probs: np.ndarray, std_probs: np.ndarray) -> np.ndarray:
+        """Compute composite confidence score for predictions."""
+        return composite_confidence(
+            mean_probs, std_probs,
+            calibrated=(self.calibrator is not None),
+        )
+
+    def _log_confidence(self, symbol: str, side: str, horizon: str,
+                        adj_prob: float, confidence: float, pred_std: float):
+        """Record prediction confidence for live monitoring."""
+        from datetime import datetime, timezone
+        self._confidence_log.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "symbol": symbol,
+            "side": side,
+            "horizon": horizon,
+            "adj_prob": adj_prob,
+            "confidence": confidence,
+            "pred_std": pred_std,
+        })
+        # Periodically save to disk (every 100 entries)
+        if len(self._confidence_log) >= 100:
+            self._flush_confidence_log()
+
+    def _flush_confidence_log(self):
+        """Save confidence log to CSV."""
+        if not self._confidence_log:
+            return
+        log_path = PROJECT_ROOT / "outputs" / "confidence_live_log.csv"
+        df = pd.DataFrame(self._confidence_log)
+        if log_path.exists():
+            df.to_csv(log_path, mode="a", header=False, index=False)
+        else:
+            df.to_csv(log_path, index=False)
+        self._confidence_log.clear()
 
     def generate_signals(self) -> List[Dict]:
         """
@@ -488,7 +609,8 @@ class TradingBot:
         diag_vol_filtered = 0
         diag_below_threshold = 0
         diag_evaluated = 0
-        diag_best_adj: Dict[str, float] = {}  # track best adj_prob per symbol
+        diag_best_adj_buy: Dict[str, float] = {}   # track best BUY adj_prob per symbol
+        diag_best_adj_sell: Dict[str, float] = {}  # track best SELL adj_prob per symbol
 
         for sym in self.symbols:
             mt5_name = sym["name"]
@@ -504,7 +626,10 @@ class TradingBot:
                 continue
 
             X, df = result
-            mean_probs, std_probs = self._mc_predict(X)
+            # Look up the symbol's integer ID for the embedding input
+            symbol_stem = f"{safe_name}_daily_processed"
+            sym_id = self.symbol_ids.get(symbol_stem, 0)
+            mean_probs, std_probs = self._mc_predict(X, symbol_id=sym_id)
 
             # Get the latest close and ATR for position sizing
             latest_close = float(df["close"].iloc[-1])
@@ -527,13 +652,18 @@ class TradingBot:
                         continue
 
             diag_evaluated += 1
-            sym_best_adj = 0.0
+            sym_best_buy = 0.0
+            sym_best_sell = 0.0
+
+            # Compute composite confidence for this instrument
+            confidence_scores = self._compute_confidence(mean_probs, std_probs)
 
             for i, h in enumerate(horizons):
                 # --- BUY signal (upside probability, outputs 0..3) ---
                 pred_prob = float(mean_probs[0, i])
                 pred_std = float(std_probs[0, i])
                 adj_prob = pred_prob - self.config["STD_FACTOR"] * pred_std
+                conf_buy = float(confidence_scores[0, i])
 
                 # Use separate threshold for BUY signals (fallback to MIN_ACCEPTED for backward compat)
                 min_threshold_buy = self.config.get("MIN_ACCEPTED_BUY", self.config["MIN_ACCEPTED"])
@@ -547,10 +677,12 @@ class TradingBot:
                         "pred_prob": pred_prob,
                         "pred_std": pred_std,
                         "adj_prob": adj_prob,
+                        "confidence": conf_buy,
                         "close": latest_close,
                         "atr": latest_atr,
                         "type": sym.get("type", "Unknown"),
                     })
+                    self._log_confidence(safe_name, "BUY", h, adj_prob, conf_buy, pred_std)
                 else:
                     diag_below_threshold += 1
 
@@ -558,8 +690,10 @@ class TradingBot:
                 pred_prob_down = float(mean_probs[0, n_horizons + i])
                 pred_std_down = float(std_probs[0, n_horizons + i])
                 adj_prob_down = pred_prob_down - self.config["STD_FACTOR"] * pred_std_down
+                conf_sell = float(confidence_scores[0, n_horizons + i])
 
-                sym_best_adj = max(sym_best_adj, adj_prob, adj_prob_down)
+                sym_best_buy = max(sym_best_buy, adj_prob)
+                sym_best_sell = max(sym_best_sell, adj_prob_down)
 
                 # Use separate threshold for SELL signals (fallback to MIN_ACCEPTED for backward compat)
                 min_threshold_sell = self.config.get("MIN_ACCEPTED_SELL", self.config["MIN_ACCEPTED"])
@@ -573,14 +707,17 @@ class TradingBot:
                         "pred_prob": pred_prob_down,
                         "pred_std": pred_std_down,
                         "adj_prob": adj_prob_down,
+                        "confidence": conf_sell,
                         "close": latest_close,
                         "atr": latest_atr,
                         "type": sym.get("type", "Unknown"),
                     })
+                    self._log_confidence(safe_name, "SELL", h, adj_prob_down, conf_sell, pred_std_down)
                 else:
                     diag_below_threshold += 1
 
-            diag_best_adj[mt5_name] = sym_best_adj
+            diag_best_adj_buy[mt5_name] = sym_best_buy
+            diag_best_adj_sell[mt5_name] = sym_best_sell
 
         # --- Diagnostic summary ---
         total_syms = len(self.symbols)
@@ -592,18 +729,27 @@ class TradingBot:
             f"{diag_evaluated} evaluated | {diag_below_threshold} horizon-checks below threshold"
         )
         logger.info(f"Thresholds: BUY>={min_buy:.3f}, SELL>={min_sell:.3f}")
-        if diag_best_adj:
-            # Show top 5 symbols closest to passing threshold
-            top5 = sorted(diag_best_adj.items(), key=lambda x: x[1], reverse=True)[:5]
+        if diag_best_adj_buy:
+            top5_buy = sorted(diag_best_adj_buy.items(), key=lambda x: x[1], reverse=True)[:5]
             logger.info(
                 f"Top adj_prob vs BUY threshold ({min_buy:.3f}): "
-                + ", ".join(f"{name}={val:.4f}" for name, val in top5)
+                + ", ".join(f"{name}={val:.4f}" for name, val in top5_buy)
+            )
+        if diag_best_adj_sell:
+            top5_sell = sorted(diag_best_adj_sell.items(), key=lambda x: x[1], reverse=True)[:5]
+            logger.info(
+                f"Top adj_prob vs SELL threshold ({min_sell:.3f}): "
+                + ", ".join(f"{name}={val:.4f}" for name, val in top5_sell)
             )
 
-        # Apply horizon weights to ranking score
+        # Apply horizon weights to ranking score, boosted by composite confidence
         horizon_weights = self.config.get("HORIZON_WEIGHTS", {"1d": 1.5, "1w": 1.2, "1m": 1.0, "6m": 0.6})
+        conf_weight = self.config.get("CONFIDENCE_SCORE_WEIGHT", 0.3)
         for c in candidates:
-            c["weighted_score"] = c["adj_prob"] * horizon_weights.get(c["horizon"], 1.0)
+            hw = horizon_weights.get(c["horizon"], 1.0)
+            conf = c.get("confidence", 0.5)
+            # weighted_score = adj_prob * horizon_weight * (1 + confidence_weight * confidence)
+            c["weighted_score"] = c["adj_prob"] * hw * (1.0 + conf_weight * conf)
 
         # Sort by weighted score descending (best signals first)
         candidates.sort(key=lambda x: x["weighted_score"], reverse=True)
@@ -1347,7 +1493,7 @@ class TradingBot:
                                               horizon=candidate["horizon"])
 
             # Comment with signal info
-            comment = f"bot:{candidate['horizon']}:{candidate['adj_prob']:.2f}"
+            comment = f"bot:{candidate['horizon']}:{candidate['adj_prob']:.2f}:c{candidate.get('confidence', 0):.2f}"
 
             try:
                 result = self.mt5.place_market_order(
@@ -1429,6 +1575,25 @@ class TradingBot:
 
         self.running = True
 
+        # Pre-flight data quality checks
+        try:
+            from src.data.quality_checks import run_all_checks
+            issues = run_all_checks()
+            errors = [msg for sev, msg in issues if sev == "ERROR"]
+            warnings_ = [msg for sev, msg in issues if sev == "WARNING"]
+            if errors:
+                for e in errors:
+                    logger.error(f"Quality check ERROR: {e}")
+                if self.config.get("NOTIFY_ON_ERROR", True):
+                    self.notifier.send(f"⚠️ {len(errors)} data quality ERROR(s) at startup")
+            if warnings_:
+                for w in warnings_:
+                    logger.warning(f"Quality check WARNING: {w}")
+            if not errors:
+                logger.info(f"Data quality checks passed ({len(warnings_)} warnings)")
+        except Exception as e:
+            logger.warning(f"Data quality checks unavailable: {e}")
+
         # Graceful shutdown handler
         def _shutdown(signum, frame):
             logger.info("Shutdown signal received – stopping bot...")
@@ -1498,6 +1663,12 @@ class TradingBot:
                 time.sleep(60)  # Wait before retrying
 
         logger.info("Bot stopped.")
+
+        # Flush any remaining confidence log entries
+        try:
+            self._flush_confidence_log()
+        except Exception:
+            pass
 
         # Final summary
         try:

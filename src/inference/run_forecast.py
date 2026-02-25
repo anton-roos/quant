@@ -10,6 +10,10 @@ import sys
 import logging
 from pathlib import Path
 
+# Ensure project root is on sys.path so `src.*` imports work when run directly
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
+
 # Set random seeds for reproducibility BEFORE importing TensorFlow/numpy
 from src.utils.constants import RANDOM_SEED, EXCLUDED_COLS, HORIZONS, HORIZON_DAYS, CATEGORY_FOLDERS, sanitize_filename
 
@@ -42,9 +46,10 @@ import json
 import hashlib
 
 # Shared modules
-from src.models.layers import MCDropout, Attention
+from src.models.layers import MCDropout, Attention, binary_focal_loss
 from src.models.lstm import build_model
 from src.models.context import PipelineContext
+from src.models.calibration import fit_calibrator, save_calibrator
 from src.config import TrainingConfig
 
 # Configure logging
@@ -75,6 +80,7 @@ CONFIG = {
     "MC_DROPOUT_SAMPLES": _training_cfg.MC_DROPOUT_SAMPLES,
     "EXCLUDED_COLS": EXCLUDED_COLS,
     "PROB_THRESHOLD": _training_cfg.PROB_THRESHOLD,
+    "SIGMA_FACTOR": _training_cfg.SIGMA_FACTOR,
     "RANDOM_SEED": RANDOM_SEED,
     "MIN_VAL_AUC": _training_cfg.MIN_VAL_AUC,
     "BATCH_SIZE": _training_cfg.BATCH_SIZE,
@@ -102,6 +108,8 @@ scaler = _ctx.scaler
 feature_cols = None
 global_thresholds_up = None
 global_thresholds_down = None
+per_symbol_thresholds = None   # dict[symbol_stem, {"up": {...}, "down": {...}}]
+symbol_ids = None               # dict[symbol_stem, int]
 
 logger.info(f"Config: {CONFIG}")
 
@@ -122,12 +130,19 @@ def mc_dropout_predict(model, X, n_samples=50):
 # DATA PROCESSING HELPERS
 # ============================================================================
 
-def compute_horizon_thresholds(df, train_cutoff=None):
-    """Compute required return thresholds for each horizon (2 sigma above/below average).
+def compute_horizon_thresholds(df, train_cutoff=None, sigma_factor=None):
+    """Compute required return thresholds for each horizon.
     
+    Uses ``sigma_factor × σ`` above/below the mean.  Lower values (e.g. 1.5)
+    increase the positive label rate from ~2.3% to ~6.7%, giving the model
+    more signal to learn from.
+
     If train_cutoff is provided, only uses data before the cutoff to prevent
     leaking future test-set statistics into the training labels.
     """
+    if sigma_factor is None:
+        sigma_factor = CONFIG.get("SIGMA_FACTOR", 1.5)
+
     if train_cutoff is not None:
         df_train = df[df["date"] < train_cutoff]
         if df_train.empty:
@@ -140,8 +155,8 @@ def compute_horizon_thresholds(df, train_cutoff=None):
     for h in HORIZONS:
         mu = df_train[f"Target_{h}"].mean()
         sig = df_train[f"Target_{h}"].std()
-        thresholds_up[h] = mu + 2 * sig
-        thresholds_down[h] = mu - 2 * sig
+        thresholds_up[h] = mu + sigma_factor * sig
+        thresholds_down[h] = mu - sigma_factor * sig
     return thresholds_up, thresholds_down
 
 
@@ -171,18 +186,24 @@ def process_instrument(csv_path: Path, for_training=True, ctx: PipelineContext =
         _fc = _ctx.feature_cols or feature_cols
         _tu = _ctx.thresholds_up or global_thresholds_up
         _td = _ctx.thresholds_down or global_thresholds_down
+        _pst = _ctx.per_symbol_thresholds or per_symbol_thresholds
     else:
         _sc = ctx.scaler
         _fc = ctx.feature_cols
         _tu = ctx.thresholds_up
         _td = ctx.thresholds_down
+        _pst = ctx.per_symbol_thresholds
 
     df = pd.read_csv(csv_path, parse_dates=["date"]).sort_values("date").reset_index(drop=True)
     df = add_features(df)
 
-    # Use pre-computed global thresholds (training-only) if available,
-    # otherwise fall back to per-instrument thresholds (no cutoff).
-    if _tu is not None and _td is not None:
+    # Prefer per-symbol thresholds so each instrument's binary labels
+    # reflect its own volatility profile instead of the global average.
+    symbol_stem = csv_path.stem
+    if _pst and symbol_stem in _pst:
+        thresholds_up = _pst[symbol_stem]["up"]
+        thresholds_down = _pst[symbol_stem]["down"]
+    elif _tu is not None and _td is not None:
         thresholds_up = _tu
         thresholds_down = _td
     else:
@@ -297,7 +318,12 @@ def cache_preprocessed(csv_path: Path, train_cutoff, train_val_cutoff, ctx: Pipe
 # ============================================================================
 
 class InstrumentDataGenerator(tf.keras.utils.Sequence):
-    """Generates batches of instrument data for training"""
+    """Generates batches of instrument data for training.
+
+    When ``symbol_id_map`` is provided the generator yields
+    ``([X_batch, sym_id_batch], y_batch)`` so the model receives
+    per-symbol identity information through its embedding input.
+    """
     def __init__(
         self,
         csv_paths,
@@ -306,6 +332,7 @@ class InstrumentDataGenerator(tf.keras.utils.Sequence):
         shuffle=True,
         use_time_weights=True,
         decay_factor=0.001,
+        symbol_id_map=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -315,6 +342,7 @@ class InstrumentDataGenerator(tf.keras.utils.Sequence):
         self.split = split
         self.use_time_weights = use_time_weights
         self.decay_factor = decay_factor
+        self.symbol_id_map = symbol_id_map or {}
         self.windows = []
         self.symbol_names = [Path(p).stem for p in csv_paths]
         self._prepare_indices()
@@ -346,7 +374,7 @@ class InstrumentDataGenerator(tf.keras.utils.Sequence):
 
     def __getitem__(self, idx):
         batch_indices = self.indices[idx * self.batch_size:(idx + 1) * self.batch_size]
-        X_batch, y_batch = [], []
+        X_batch, y_batch, sym_ids_batch = [], [], []
         weights_batch = [] if self.use_time_weights else None
         cache = {}
         for bi in batch_indices:
@@ -358,6 +386,7 @@ class InstrumentDataGenerator(tf.keras.utils.Sequence):
             X_arr, y_arr = cache[symbol_name]
             X_batch.append(X_arr[win_idx])
             y_batch.append(y_arr[win_idx])
+            sym_ids_batch.append(self.symbol_id_map.get(symbol_name, 0))
 
             if self.use_time_weights:
                 if symbol_name in self.date_arrays:
@@ -371,9 +400,17 @@ class InstrumentDataGenerator(tf.keras.utils.Sequence):
 
         X_out = np.array(X_batch, dtype=np.float32)
         y_out = np.array(y_batch, dtype=np.float32)
+        sym_ids_out = np.array(sym_ids_batch, dtype=np.int32)
+
+        # Build multi-input list when symbol IDs are available
+        if self.symbol_id_map:
+            x_inputs = [X_out, sym_ids_out]
+        else:
+            x_inputs = X_out
+
         if self.use_time_weights:
-            return (X_out, y_out, np.array(weights_batch, dtype=np.float32))
-        return (X_out, y_out)
+            return (x_inputs, y_out, np.array(weights_batch, dtype=np.float32))
+        return (x_inputs, y_out)
 
     def on_epoch_end(self):
         if self.shuffle:
@@ -384,9 +421,18 @@ class InstrumentDataGenerator(tf.keras.utils.Sequence):
 # MODEL AND FORECASTING
 # ============================================================================
 
-def make_forecast(model, X, dates, closes, horizons, horizon_days):
-    """Generate forecast dataframe with predictions and uncertainty"""
-    y_pred_mean, y_pred_std, _ = mc_dropout_predict(model, X, n_samples=CONFIG["MC_DROPOUT_SAMPLES"])
+def make_forecast(model, X, dates, closes, horizons, horizon_days, symbol_id=None):
+    """Generate forecast dataframe with predictions and uncertainty.
+
+    When ``symbol_id`` is provided the model is called with multi-input
+    ``[X, sym_ids]`` to leverage the learned symbol embedding.
+    """
+    if symbol_id is not None:
+        sym_ids = np.full((len(X), 1), symbol_id, dtype=np.int32)
+        model_input = [X, sym_ids]
+    else:
+        model_input = X
+    y_pred_mean, y_pred_std, _ = mc_dropout_predict(model, model_input, n_samples=CONFIG["MC_DROPOUT_SAMPLES"])
     df_dict = {"Date": dates, "Close": closes}
 
     n_horizons = len(horizons)
@@ -406,17 +452,34 @@ def make_forecast(model, X, dates, closes, horizons, horizon_days):
 
 
 def feature_importance(model, X_val, y_val, feature_names):
-    """Compute feature importance via permutation"""
+    """Compute feature importance via permutation.
+
+    ``X_val`` may be a list ``[X_ts, sym_ids]`` for multi-input models.
+    Only the time-series tensor is permuted; the symbol IDs stay fixed.
+    """
     from sklearn.metrics import mean_squared_error
+
+    # Separate time-series input from auxiliary inputs
+    if isinstance(X_val, list):
+        X_ts = X_val[0]
+        aux_inputs = X_val[1:]
+    else:
+        X_ts = X_val
+        aux_inputs = []
+
+    def _predict(X_ts_in):
+        if aux_inputs:
+            return model.predict([X_ts_in] + aux_inputs, verbose=0)
+        return model.predict(X_ts_in, verbose=0)
     
-    base_preds = model.predict(X_val, verbose=0)
+    base_preds = _predict(X_ts)
     base_loss = mean_squared_error(y_val, base_preds)
     importances = []
 
     for i, col in enumerate(feature_names):
-        X_val_permuted = X_val.copy()
+        X_val_permuted = X_ts.copy()
         np.random.shuffle(X_val_permuted[:, :, i])
-        preds = model.predict(X_val_permuted, verbose=0)
+        preds = _predict(X_val_permuted)
         loss = mean_squared_error(y_val, preds)
         importances.append(loss - base_loss)
 
@@ -514,12 +577,23 @@ def main():
     logger.info(f"Fitted scaler. n_features: {len(feature_cols)}")
 
     # ========================================================================
-    # STEP 1b: Compute classification thresholds from TRAINING data only
+    # STEP 1b: Compute classification thresholds PER SYMBOL from TRAINING data
     # ========================================================================
-    logger.info("Step 1b: Computing target thresholds from training data only...")
+    logger.info("Step 1b: Computing per-symbol target thresholds from training data only...")
     
+    global per_symbol_thresholds, symbol_ids
+
+    _sf = CONFIG.get("SIGMA_FACTOR", 1.5)
+    per_symbol_thresholds = {}
+    symbol_ids = {}
+
+    # Also accumulate global stats as a fallback for symbols with too few rows
     all_targets = {f"Target_{h}": [] for h in HORIZONS}
-    for csv_path in all_csvs:
+
+    for idx, csv_path in enumerate(all_csvs):
+        symbol_stem = Path(csv_path).stem
+        symbol_ids[symbol_stem] = idx
+
         df = pd.read_csv(csv_path, parse_dates=["date"]).sort_values("date").dropna()
         df = add_features(df)
         if df.empty:
@@ -527,20 +601,50 @@ def main():
         train_rows = df[df["date"] < train_cutoff]
         if len(train_rows) == 0:
             continue
+
+        # Accumulate for global fallback
         for h in HORIZONS:
             all_targets[f"Target_{h}"].append(train_rows[f"Target_{h}"].values)
-    
+
+        # Per-symbol thresholds — only if enough training rows for stable stats
+        if len(train_rows) >= 50:
+            sym_up, sym_down = {}, {}
+            for h in HORIZONS:
+                vals = train_rows[f"Target_{h}"].dropna().values
+                mu = np.nanmean(vals)
+                sig = np.nanstd(vals)
+                sym_up[h] = float(mu + _sf * sig)
+                sym_down[h] = float(mu - _sf * sig)
+            per_symbol_thresholds[symbol_stem] = {"up": sym_up, "down": sym_down}
+            logger.info(
+                f"  {symbol_stem}: up_1d={sym_up['1d']:.6f}, down_1d={sym_down['1d']:.6f} "
+                f"(n_train={len(train_rows)})"
+            )
+
+    # Global fallback thresholds (for symbols with <50 train rows)
     global_thresholds_up = {}
     global_thresholds_down = {}
     for h in HORIZONS:
         vals = np.concatenate(all_targets[f"Target_{h}"])
         mu = np.nanmean(vals)
         sig = np.nanstd(vals)
-        global_thresholds_up[h] = mu + 2 * sig
-        global_thresholds_down[h] = mu - 2 * sig
-        logger.info(f"  {h}: up_thresh={global_thresholds_up[h]:.6f}, down_thresh={global_thresholds_down[h]:.6f} (mu={mu:.6f}, sig={sig:.6f})")
-    
-    logger.info("Thresholds computed from training data only (no leakage)")
+        global_thresholds_up[h] = float(mu + _sf * sig)
+        global_thresholds_down[h] = float(mu - _sf * sig)
+        logger.info(f"  GLOBAL {h}: up={global_thresholds_up[h]:.6f}, down={global_thresholds_down[h]:.6f}")
+
+    # Assign global thresholds to symbols without per-symbol stats
+    for csv_path in all_csvs:
+        symbol_stem = Path(csv_path).stem
+        if symbol_stem not in per_symbol_thresholds:
+            per_symbol_thresholds[symbol_stem] = {
+                "up": global_thresholds_up,
+                "down": global_thresholds_down,
+            }
+            logger.info(f"  {symbol_stem}: using GLOBAL thresholds (insufficient training data)")
+
+    n_symbols = len(symbol_ids)
+    logger.info(f"Per-symbol thresholds computed for {len(per_symbol_thresholds)} instruments, "
+                f"{n_symbols} symbol IDs assigned")
 
     # Populate module-level PipelineContext for use by process_instrument
     _ctx = PipelineContext(
@@ -548,6 +652,8 @@ def main():
         feature_cols=feature_cols,
         thresholds_up=global_thresholds_up,
         thresholds_down=global_thresholds_down,
+        per_symbol_thresholds=per_symbol_thresholds,
+        symbol_ids=symbol_ids,
     )
 
     # ========================================================================
@@ -570,8 +676,16 @@ def main():
     # ========================================================================
     logger.info("Step 3: Creating data generators...")
     
-    train_gen = InstrumentDataGenerator(all_csvs, batch_size=128, split="train", shuffle=True, use_time_weights=False, decay_factor=0.002)
-    val_gen = InstrumentDataGenerator(all_csvs, batch_size=128, split="val", shuffle=False, use_time_weights=False)
+    train_gen = InstrumentDataGenerator(
+        all_csvs, batch_size=128, split="train", shuffle=True,
+        use_time_weights=True, decay_factor=0.002,
+        symbol_id_map=symbol_ids,
+    )
+    val_gen = InstrumentDataGenerator(
+        all_csvs, batch_size=128, split="val", shuffle=False,
+        use_time_weights=False,
+        symbol_id_map=symbol_ids,
+    )
     
     logger.info(f"Train generator length: {len(train_gen)}")
     logger.info(f"Val generator length: {len(val_gen)}")
@@ -582,7 +696,7 @@ def main():
     logger.info("Step 4: Building model...")
     
     n_features = len(feature_cols)
-    model = build_model(n_features, CONFIG["WINDOW_SIZE"])
+    model = build_model(n_features, CONFIG["WINDOW_SIZE"], n_symbols=n_symbols)
 
     early_stop = EarlyStopping(
         patience=CONFIG["EARLY_STOP_PATIENCE"],
@@ -599,31 +713,24 @@ def main():
         verbose=1,
     )
 
-    model.compile(optimizer="adam", loss="binary_crossentropy", metrics=[AUC(name="auc")])
-    
-    # Compute class weights to handle severe imbalance (~2.3% positive rate)
-    # Approximate from the 2-sigma threshold: positive rate ~2.3%, negative ~97.7%
-    logger.info("Computing class weights for imbalanced targets...")
+    # Use focal loss instead of binary_crossentropy to handle severe class
+    # imbalance (~5-7% positive rate at 1.5σ).  Focal loss down-weights easy
+    # negatives so the gradient signal comes from informative hard examples.
+    focal_loss = binary_focal_loss(gamma=2.0, alpha=0.25)
+    model.compile(optimizer="adam", loss=focal_loss, metrics=[AUC(name="auc")])
+
+    # Log estimated positive rate for diagnostics
     try:
-        # Sample from training data to estimate positive rate
         sample_batch = train_gen[0]
         y_sample = sample_batch[1] if isinstance(sample_batch, tuple) else sample_batch
         pos_rate = float(np.mean(y_sample > 0.5))
-        if pos_rate > 0 and pos_rate < 1:
-            neg_rate = 1.0 - pos_rate
-            # class_weight for binary: weight inversely proportional to frequency
-            cw = {0: 0.5 / neg_rate, 1: 0.5 / pos_rate}
-            logger.info(f"Class weights: {{0: {cw[0]:.3f}, 1: {cw[1]:.3f}}} (pos_rate={pos_rate:.4f})")
-        else:
-            cw = None
-            logger.warning(f"Cannot compute class weights (pos_rate={pos_rate}), training without")
-    except Exception as e:
-        logger.warning(f"Class weight computation failed: {e}, training without")
-        cw = None
+        logger.info(f"Estimated positive label rate: {pos_rate:.4f} ({pos_rate*100:.1f}%)")
+    except Exception:
+        pass
 
-    logger.info("Training model...")
+    logger.info("Training model with focal loss (gamma=2.0, alpha=0.25)...")
     history = model.fit(train_gen, validation_data=val_gen, callbacks=[early_stop, reduce_lr], 
-                        epochs=CONFIG["MAX_EPOCHS"], class_weight=cw, verbose=1)
+                        epochs=CONFIG["MAX_EPOCHS"], verbose=1)
 
     # ========================================================================
     # STEP 4b: Model quality gate — refuse to deploy a bad model
@@ -682,6 +789,52 @@ def main():
     with open(CONFIG["MODEL_DIR"] / "thresholds.json", "w") as f:
         json.dump(thresholds_artifact, f, indent=2)
     logger.info(f"Saved thresholds to {CONFIG['MODEL_DIR'] / 'thresholds.json'}")
+
+    # Save per-symbol thresholds (used by process_instrument for correct labels)
+    with open(CONFIG["MODEL_DIR"] / "per_symbol_thresholds.json", "w") as f:
+        json.dump(per_symbol_thresholds, f, indent=2)
+    logger.info(f"Saved per-symbol thresholds for {len(per_symbol_thresholds)} instruments")
+
+    # Save symbol-to-ID mapping (needed at inference time for the embedding input)
+    with open(CONFIG["MODEL_DIR"] / "symbol_ids.json", "w") as f:
+        json.dump(symbol_ids, f, indent=2)
+    logger.info(f"Saved symbol_ids for {len(symbol_ids)} instruments")
+
+    # ========================================================================
+    # STEP 4d: Fit probability calibrator on validation predictions
+    # ========================================================================
+    logger.info("Step 4d: Fitting probability calibrator on validation set...")
+
+    try:
+        # Collect all validation predictions and labels
+        y_val_all, y_prob_all = [], []
+        for batch_idx in range(len(val_gen)):
+            batch = val_gen[batch_idx]
+            if isinstance(batch, tuple):
+                x_batch, y_batch = batch[0], batch[1]
+            else:
+                raise ValueError("val_gen did not return a tuple.")
+            preds = model.predict(x_batch, verbose=0)
+            y_val_all.append(y_batch)
+            y_prob_all.append(preds)
+
+        y_val_concat = np.concatenate(y_val_all, axis=0)
+        y_prob_concat = np.concatenate(y_prob_all, axis=0)
+
+        calibrator = fit_calibrator(y_val_concat, y_prob_concat, method="isotonic")
+        save_calibrator(calibrator)
+        logger.info("Calibrator fitted and saved successfully")
+
+        # Log calibration effect on a sample
+        cal_probs = calibrator.transform(y_prob_concat[:100])
+        logger.info(
+            f"  Raw probs range:  [{y_prob_concat[:100].min():.4f}, {y_prob_concat[:100].max():.4f}]"
+        )
+        logger.info(
+            f"  Cal probs range:  [{cal_probs.min():.4f}, {cal_probs.max():.4f}]"
+        )
+    except Exception as e:
+        logger.warning(f"Calibrator fitting failed: {e} — raw probabilities will be used")
 
     # Save training history plot
     plt.figure(figsize=(10, 6))
@@ -760,13 +913,15 @@ def main():
         if X_all.size == 0:
             continue
 
+        sym_id = symbol_ids.get(symbol_name, 0)
         forecast_df = make_forecast(
             model=model,
             X=X_all,
             dates=pred_dates,
             closes=closes,
             horizons=horizons,
-            horizon_days=horizon_days
+            horizon_days=horizon_days,
+            symbol_id=sym_id,
         )
 
         forecast_df.to_csv(CONFIG["FORECAST_DIR"] / f"{symbol_name}_forecast.csv", index=False)
