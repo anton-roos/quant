@@ -15,7 +15,7 @@ from keras.layers import Dropout, Layer
 # Focal Loss — handles severe class imbalance (e.g. 2-7% positive rate)
 # ---------------------------------------------------------------------------
 
-def binary_focal_loss(gamma: float = 2.0, alpha: float = 0.25):
+def binary_focal_loss(gamma: float = 2.0, alpha: float = 0.75):
     """Binary focal loss for multi-label sigmoid outputs.
 
     Focal loss down-weights easy (well-classified) examples so the model
@@ -27,10 +27,10 @@ def binary_focal_loss(gamma: float = 2.0, alpha: float = 0.25):
         Focusing parameter.  Higher values suppress easy negatives more.
         ``gamma=0`` recovers standard binary cross-entropy.
     alpha : float
-        Balance factor for positives.  ``alpha=0.25`` means positives get
-        weight 0.25 and negatives 0.75 (counterintuitively, lower alpha
-        for the minority class works well with focal loss because gamma
-        already up-weights hard examples).
+        Balance factor for positives.  With ~5% positive rate set alpha
+        high (0.75-0.85) to compensate for class imbalance — otherwise
+        the model finds the degenerate "predict near-zero for everything"
+        solution that minimises focal loss for the majority class.
 
     Returns
     -------
@@ -57,6 +57,50 @@ def binary_focal_loss(gamma: float = 2.0, alpha: float = 0.25):
 
     focal_loss_fn.__name__ = "binary_focal_loss"
     return focal_loss_fn
+
+
+def pnl_weighted_focal_loss(gamma: float = 2.0, alpha: float = 0.75):
+    """P&L-weighted focal loss for multi-label sigmoid outputs.
+
+    Identical to binary_focal_loss but scales each sample's loss by an
+    ATR-normalised reward weight appended as the 9th output channel:
+
+        y_true shape: (batch, 9)  — first 8 = class labels, last 1 = ATR weight
+        y_pred shape: (batch, 8)  — sigmoid outputs (unchanged)
+
+    The ATR weight  w = clip(ATR_14 / close, 0.5, 2.0)  gives larger
+    instruments (higher relative ATR) proportionally higher gradients,
+    so the model focuses on high-magnitude-move opportunities.
+
+    Enable via config:  PNL_LOSS_ENABLED: true
+    """
+    def loss_fn(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        # Split off the weight channel (last column)
+        atr_weight = y_true[:, -1:]          # (batch, 1)
+        y_labels = y_true[:, :-1]            # (batch, 8)
+
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+
+        bce_pos = -y_labels * tf.math.log(y_pred)
+        bce_neg = -(1.0 - y_labels) * tf.math.log(1.0 - y_pred)
+
+        p_t = y_labels * y_pred + (1.0 - y_labels) * (1.0 - y_pred)
+        focal_weight = tf.pow(1.0 - p_t, gamma)
+
+        alpha_t = y_labels * alpha + (1.0 - y_labels) * (1.0 - alpha)
+
+        # Base focal loss per sample (mean over output heads)
+        per_sample_loss = tf.reduce_mean(
+            alpha_t * focal_weight * (bce_pos + bce_neg), axis=-1, keepdims=True
+        )  # (batch, 1)
+
+        # Scale by ATR weight (clipped to [0.5, 2.0] during label creation)
+        weighted_loss = per_sample_loss * (1.0 + atr_weight)
+        return tf.reduce_mean(weighted_loss)
+
+    loss_fn.__name__ = "pnl_weighted_focal_loss"
+    return loss_fn
 
 
 class MCDropout(Dropout):

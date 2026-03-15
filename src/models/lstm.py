@@ -12,12 +12,68 @@ symbol-specific predictions instead of near-constant outputs.
 
 from keras.models import Model
 from keras.layers import (
-    Concatenate, Conv1D, Dense, Embedding, Flatten, GaussianNoise,
+    Concatenate, Conv1D, Dense, Dropout, Embedding, Flatten, GaussianNoise,
     Input, LSTM, BatchNormalization, Reshape,
 )
 from keras.regularizers import l2
 
 from src.models.layers import MCDropout
+
+
+def build_encoder(
+    n_features: int,
+    window_size: int,
+) -> Model:
+    """Build just the Conv1D+LSTM encoder trunk (without Dense head).
+
+    Used by self-supervised pre-training and the GNN overlay.
+    The output is the LSTM's final hidden state, shape (batch, 64).
+    """
+    _l2 = l2(1e-5)
+    ts_input = Input(shape=(window_size + 1, n_features), name="ts_input")
+    x = GaussianNoise(0.01)(ts_input)
+    x = Conv1D(64, kernel_size=3, activation="relu", padding="same", kernel_regularizer=_l2)(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.3)(x)
+    x = Conv1D(32, kernel_size=3, activation="relu", padding="same", kernel_regularizer=_l2)(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.2)(x)
+    x = LSTM(128, return_sequences=True, kernel_regularizer=_l2)(x)
+    x = Dropout(0.35)(x)
+    x = LSTM(64, return_sequences=False, kernel_regularizer=_l2)(x)
+    return Model(inputs=ts_input, outputs=x, name="encoder")
+
+
+def build_encoder_decoder(
+    n_features: int,
+    window_size: int,
+    n_future: int = 5,
+) -> Model:
+    """Build encoder + decoder for self-supervised next-candle pre-training.
+
+    The decoder predicts the log-returns for the next ``n_future`` candles
+    across all ``n_features`` dimensions, giving the model a rich signal
+    to learn price dynamics before fine-tuning on the classification task.
+
+    Parameters
+    ----------
+    n_features : int
+    window_size : int
+    n_future : int
+        Number of future timesteps to predict (default 5 = one week).
+
+    Returns
+    -------
+    Model
+        Uncompiled Keras model with MSE-friendly Dense outputs.
+    """
+    encoder = build_encoder(n_features, window_size)
+    ts_input = encoder.input
+    z = encoder.output                                      # (batch, 64)
+    out = Dense(128, activation="relu")(z)
+    out = Dense(n_future * n_features)(out)                 # flat prediction
+    out = Reshape((n_future, n_features), name="future_pred")(out)
+    return Model(inputs=ts_input, outputs=out, name="encoder_decoder")
 
 
 def build_model(
@@ -51,30 +107,34 @@ def build_model(
     Model
         An **uncompiled** Keras Functional-API model.
     """
-    _l2 = l2(1e-4)
+    # Lighter regularisation — l2(1e-4) dominated the tiny focal-loss values
+    # and pushed weights to zero, causing the "predict everything near-zero" collapse.
+    _l2 = l2(1e-5)
 
     # --- Primary input: time-series window ---
     ts_input = Input(shape=(window_size + 1, n_features), name="ts_input")
 
     x = GaussianNoise(0.01)(ts_input)
 
-    # Temporal convolution to capture local patterns
+    # Temporal convolution to capture local patterns.
+    # Use standard Dropout (not MCDropout) so validation metrics are stable —
+    # MC-Dropout inference is handled by calling model(x, training=True) externally.
     x = Conv1D(64, kernel_size=3, activation="relu", padding="same",
                kernel_regularizer=_l2)(x)
     x = BatchNormalization()(x)
-    x = MCDropout(0.4)(x)
+    x = Dropout(0.3)(x)
 
     # Second conv layer for higher-level patterns
     x = Conv1D(32, kernel_size=3, activation="relu", padding="same",
                kernel_regularizer=_l2)(x)
     x = BatchNormalization()(x)
-    x = MCDropout(0.3)(x)
+    x = Dropout(0.2)(x)
 
     # Stacked LSTMs for long-range dependencies
     x = LSTM(128, return_sequences=True, kernel_regularizer=_l2)(x)
-    x = MCDropout(0.4)(x)
+    x = Dropout(0.35)(x)
     x = LSTM(64, return_sequences=False, kernel_regularizer=_l2)(x)
-    x = MCDropout(0.4)(x)
+    x = Dropout(0.35)(x)
 
     # --- Optional symbol embedding ---
     if n_symbols > 0:
@@ -89,7 +149,7 @@ def build_model(
     # Dense head
     x = Dense(64, activation="relu", kernel_regularizer=_l2)(x)
     x = BatchNormalization()(x)
-    x = MCDropout(0.3)(x)
+    x = Dropout(0.25)(x)
     x = Dense(32, activation="relu", kernel_regularizer=_l2)(x)
     outputs = Dense(n_outputs, activation="sigmoid")(x)
 

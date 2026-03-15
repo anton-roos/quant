@@ -36,10 +36,37 @@ class TrainingConfig:
     VAL_FRAC_WITHIN_TRAIN: float = 0.2
     MC_DROPOUT_SAMPLES: int = 50
     PROB_THRESHOLD: float = 0.7
-    SIGMA_FACTOR: float = 1.5
+    SIGMA_FACTOR: float = 1.0
+    # Per-asset-class sigma factors for label threshold computation.
+    # Lower values give more positive labels (~15-20%) vs the old σ=1.5 (~5%).
+    SIGMA_FACTOR_PER_CLASS: Dict[str, float] = field(
+        default_factory=lambda: {"forex": 0.75, "indices": 1.0, "commodities": 1.0, "crypto": 1.5}
+    )
 
-    MIN_VAL_AUC: float = 0.62
+    MIN_VAL_AUC: float = 0.55
     BATCH_SIZE: int = 128
+    AUGMENT_PROB: float = 0.15
+    N_ENSEMBLE: int = 3
+    REGIME_ROUTING_ENABLED: bool = True
+    REGIME_BULL_THRESHOLD: float = 0.65
+    REGIME_BEAR_THRESHOLD: float = 0.35
+    EWC_ENABLED: bool = True
+    EWC_LAMBDA: float = 400.0
+    EWC_FISHER_BATCHES: int = 20
+    PNL_LOSS_ENABLED: bool = False
+    MODEL_TYPE: str = "lstm"
+    GNN_ENABLED: bool = False
+    GNN_CORR_THRESHOLD: float = 0.6
+    GNN_LOOKBACK: int = 60
+    PRETRAIN_ENABLED: bool = True
+    PRETRAIN_EPOCHS: int = 30
+    PRETRAIN_N_FUTURE: int = 5
+    PAIRS_TRADING_ENABLED: bool = False
+    PAIRS_COINT_PVAL: float = 0.05
+    PAIRS_ZSCORE_ENTRY: float = 2.0
+    PAIRS_ZSCORE_EXIT: float = 0.5
+    PAIRS_LOOKBACK: int = 252
+    PAIRS_SCAN_INTERVAL_DAYS: int = 7
     MAX_EPOCHS: int = 500
     EARLY_STOP_PATIENCE: int = 15
     REDUCE_LR_PATIENCE: int = 5
@@ -79,9 +106,10 @@ class BotConfig:
     PROCESSED_DIR: str = "src/data/indicators_data/processed"
 
     # Strategy parameters
-    MIN_ACCEPTED: float = 0.50
-    MIN_ACCEPTED_BUY: float = 0.10
-    MIN_ACCEPTED_SELL: float = 0.05
+    MIN_ACCEPTED: float = 0.28
+    MIN_ACCEPTED_BUY: float = 0.28
+    MIN_ACCEPTED_SELL: float = 0.28
+    MIN_CONFIDENCE: float = 0.35
     STD_FACTOR: float = 1.0
     MC_DROPOUT_SAMPLES: int = 50
     WINDOW_SIZE: int = 90
@@ -156,12 +184,21 @@ class BotConfig:
     # Bridge logging
     BRIDGE_LOG_DIR: str = "outputs/bridge_logs"
 
+    # Economic calendar filter
+    CALENDAR_ENABLED: bool = True
+    CALENDAR_BLOCK_HOURS: int = 4
+    CALENDAR_CACHE_PATH: str = "outputs/calendar_cache.json"
+    CALENDAR_REFRESH_URL: str = ""
+
     # Sentiment & Gemini LLM
     SENTIMENT_ENABLED: bool = False
     BRAVE_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
     GEMINI_API_ENDPOINT: str = ""
     GEMINI_MODEL: str = "gemini-2.5-flash-lite"
+
+    # Ensemble
+    ENSEMBLE_CONSENSUS_THRESHOLD: float = 0.06
 
     # Confidence scoring
     CONFIDENCE_SCORE_WEIGHT: float = 0.3

@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import joblib
+from sklearn.metrics import roc_auc_score
 
 # ---------------------------------------------------------------------------
 # Ensure project root on path
@@ -42,6 +43,7 @@ from sklearn.preprocessing import StandardScaler
 
 from src.models.layers import MCDropout, binary_focal_loss
 from src.models.lstm import build_model
+from src.models.ewc import EWC
 from src.models.context import PipelineContext
 from src.utils.constants import HORIZONS, EXCLUDED_COLS
 from src.inference.run_forecast import (
@@ -102,8 +104,8 @@ def _collect_csvs() -> list:
 # ---------------------------------------------------------------------------
 
 def evaluate_model_on_val(model, val_gen) -> float:
-    """Return average validation loss (binary cross-entropy)."""
-    losses = []
+    """Return mean ROC-AUC across all output heads on the validation set."""
+    all_preds, all_labels = [], []
     for i in range(len(val_gen)):
         batch = val_gen[i]
         if len(batch) == 3:
@@ -111,13 +113,18 @@ def evaluate_model_on_val(model, val_gen) -> float:
         else:
             X_b, y_b = batch
         preds = model.predict(X_b, verbose=0)
-        # binary cross-entropy per sample
-        eps = 1e-7
-        bce = -np.mean(
-            y_b * np.log(preds + eps) + (1 - y_b) * np.log(1 - preds + eps)
-        )
-        losses.append(bce)
-    return float(np.mean(losses))
+        all_preds.append(preds)
+        all_labels.append(y_b)
+    y_pred = np.concatenate(all_preds, axis=0)
+    y_true = np.concatenate(all_labels, axis=0)
+    aucs = []
+    for col in range(y_true.shape[1]):
+        if y_true[:, col].sum() > 0:
+            try:
+                aucs.append(roc_auc_score(y_true[:, col], y_pred[:, col]))
+            except Exception:
+                pass
+    return float(np.mean(aucs)) if aucs else 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -273,8 +280,9 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
 
     train_gen = InstrumentDataGenerator(
         all_csvs, batch_size=128, split="train", shuffle=True,
-        use_time_weights=True, decay_factor=0.002,
+        use_time_weights=True, decay_factor=0.0005,
         symbol_id_map=symbol_ids,
+        p_augment=CONFIG.get("AUGMENT_PROB", 0.15),
     )
     val_gen = InstrumentDataGenerator(
         all_csvs, batch_size=128, split="val", shuffle=False,
@@ -283,41 +291,121 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
 
     logger.info(f"Train batches: {len(train_gen)}, Val batches: {len(val_gen)}")
 
-    new_model = build_model(n_features, CONFIG["WINDOW_SIZE"], n_symbols=n_symbols)
+    model_type = CONFIG.get("MODEL_TYPE", "lstm").lower()
+    if model_type == "tft":
+        from src.models.tft import build_tft_model
+        new_model = build_tft_model(n_features, CONFIG["WINDOW_SIZE"], n_symbols=n_symbols)
+    else:
+        new_model = build_model(n_features, CONFIG["WINDOW_SIZE"], n_symbols=n_symbols)
 
-    focal_loss = binary_focal_loss(gamma=2.0, alpha=0.25)
+    focal_loss = binary_focal_loss(gamma=2.0, alpha=0.75)
     new_model.compile(optimizer="adam", loss=focal_loss, metrics=[AUC(name="auc")])
 
-    early_stop = EarlyStopping(patience=CONFIG.get("EARLY_STOP_PATIENCE", 30), monitor="val_loss", restore_best_weights=True, mode="min")
-    reduce_lr = ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=CONFIG.get("REDUCE_LR_PATIENCE", 10), min_lr=1e-6, verbose=1)
+    early_stop = EarlyStopping(patience=CONFIG.get("EARLY_STOP_PATIENCE", 30), monitor="val_auc", restore_best_weights=True, mode="max")
+    reduce_lr = ReduceLROnPlateau(monitor="val_auc", factor=0.5, patience=CONFIG.get("REDUCE_LR_PATIENCE", 10), min_lr=1e-6, verbose=1, mode="max")
 
-    new_model.fit(
-        train_gen,
-        validation_data=val_gen,
-        callbacks=[early_stop, reduce_lr],
-        epochs=CONFIG.get("MAX_EPOCHS", 500),
-        verbose=1,
-    )
+    # ------- EWC: load old model and compute Fisher before overwriting -------
+    ewc = None
+    if CONFIG.get("EWC_ENABLED", True):
+        old_model_path = CONFIG["MODEL_DIR"] / "lstm_model.keras"
+        if old_model_path.exists():
+            try:
+                old_model = load_model(
+                    old_model_path,
+                    custom_objects={"MCDropout": MCDropout, "binary_focal_loss": binary_focal_loss},
+                )
+                ewc = EWC(
+                    old_model, val_gen,
+                    n_batches=CONFIG.get("EWC_FISHER_BATCHES", 20),
+                )
+                del old_model  # free memory
+                logger.info(f"EWC initialised (lambda={CONFIG.get('EWC_LAMBDA', 400.0)})")
+            except Exception as e:
+                logger.warning(f"EWC init failed: {e} — training without EWC")
+
+    if ewc is not None:
+        # Custom training loop with EWC penalty
+        ewc_lambda = float(CONFIG.get("EWC_LAMBDA", 400.0))
+        optimizer = tf.keras.optimizers.Adam()
+        auc_metric = tf.keras.metrics.AUC(name="auc")
+        focal_fn = binary_focal_loss(gamma=2.0, alpha=0.75)
+
+        @tf.function
+        def _train_step(x, y, sw=None):
+            with tf.GradientTape() as tape:
+                preds = new_model(x, training=True)
+                task_loss = focal_fn(y, preds)
+                penalty = ewc.penalty(new_model)
+                total_loss = task_loss + ewc_lambda * penalty
+            grads = tape.gradient(total_loss, new_model.trainable_weights)
+            optimizer.apply_gradients(zip(grads, new_model.trainable_weights))
+            return total_loss, task_loss, penalty
+
+        best_val_auc = -1.0
+        patience_count = 0
+        patience = CONFIG.get("EARLY_STOP_PATIENCE", 30)
+        best_weights = [w.numpy() for w in new_model.trainable_weights]
+
+        for epoch in range(CONFIG.get("MAX_EPOCHS", 500)):
+            for batch_idx in range(len(train_gen)):
+                batch = train_gen[batch_idx]
+                x_b, y_b = batch[0], batch[1]
+                sw_b = batch[2] if len(batch) == 3 else None
+                _train_step(x_b, y_b, sw_b)
+
+            # Validation AUC
+            auc_metric.reset_state()
+            for batch_idx in range(len(val_gen)):
+                batch = val_gen[batch_idx]
+                x_b, y_b = batch[0], batch[1]
+                preds = new_model(x_b, training=False)
+                auc_metric.update_state(y_b, preds)
+            val_auc = float(auc_metric.result())
+            logger.info(f"Epoch {epoch+1}: EWC val_auc={val_auc:.4f}")
+
+            if val_auc > best_val_auc:
+                best_val_auc = val_auc
+                best_weights = [w.numpy().copy() for w in new_model.trainable_weights]
+                patience_count = 0
+            else:
+                patience_count += 1
+                if patience_count >= patience:
+                    logger.info(f"EWC early stop at epoch {epoch+1}")
+                    break
+
+            train_gen.on_epoch_end()
+
+        # Restore best weights
+        for w, bw in zip(new_model.trainable_weights, best_weights):
+            w.assign(bw)
+        logger.info(f"EWC training complete. Best val_auc: {best_val_auc:.4f}")
+    else:
+        new_model.fit(
+            train_gen,
+            validation_data=val_gen,
+            callbacks=[early_stop, reduce_lr],
+            epochs=CONFIG.get("MAX_EPOCHS", 500),
+            verbose=1,
+        )
 
     # ------------------------------------------------------------------
-    # 6. Compare new vs old model
+    # 6. Compare new vs old model (higher AUC = better)
     # ------------------------------------------------------------------
-    new_val_loss = evaluate_model_on_val(new_model, val_gen)
-    logger.info(f"New model val loss: {new_val_loss:.6f}")
+    new_val_auc = evaluate_model_on_val(new_model, val_gen)
+    logger.info(f"New model val AUC: {new_val_auc:.6f}")
 
     model_path = CONFIG["MODEL_DIR"] / "lstm_model.keras"
     deployed = False
 
     if model_path.exists():
         try:
-            old_model = load_model(model_path, custom_objects={"MCDropout": MCDropout})
-            # Need to use the new scaler for fair comparison
-            old_val_loss = evaluate_model_on_val(old_model, val_gen)
-            logger.info(f"Old model val loss: {old_val_loss:.6f}")
+            old_model = load_model(model_path, custom_objects={"MCDropout": MCDropout, "binary_focal_loss": binary_focal_loss})
+            old_val_auc = evaluate_model_on_val(old_model, val_gen)
+            logger.info(f"Old model val AUC: {old_val_auc:.6f}")
 
-            if new_val_loss < old_val_loss:
-                improvement = ((old_val_loss - new_val_loss) / old_val_loss) * 100
-                logger.info(f"New model is BETTER by {improvement:.2f}% — deploying.")
+            if new_val_auc > old_val_auc:
+                improvement = ((new_val_auc - old_val_auc) / max(old_val_auc, 1e-9)) * 100
+                logger.info(f"New model is BETTER by {improvement:.2f}% AUC — deploying.")
                 deployed = True
             else:
                 logger.info("New model is NOT better — keeping old model.")
@@ -370,7 +458,7 @@ def retrain(force: bool = False, interval_days: int = 30) -> bool:
     _save_retrain_state({
         "last_retrain_date": datetime.utcnow().isoformat(),
         "deployed": deployed,
-        "new_val_loss": new_val_loss,
+        "new_val_auc": new_val_auc,
     })
 
     logger.info("Walk-forward retrain complete.")

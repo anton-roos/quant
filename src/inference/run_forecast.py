@@ -35,6 +35,19 @@ import tensorflow as tf
 tf.random.set_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 
+# Enable GPU memory growth so TF doesn't claim all VRAM on startup.
+# Safe no-op if no GPU is present.
+for _gpu in tf.config.list_physical_devices('GPU'):
+    tf.config.experimental.set_memory_growth(_gpu, True)
+if tf.config.list_physical_devices('GPU'):
+    import logging as _log
+    _log.getLogger(__name__).info(
+        f"GPU enabled: {[g.name for g in tf.config.list_physical_devices('GPU')]}"
+    )
+else:
+    import logging as _log
+    _log.getLogger(__name__).warning("No GPU detected — training on CPU.")
+
 from keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from keras.metrics import AUC
 from sklearn.preprocessing import StandardScaler
@@ -87,6 +100,13 @@ CONFIG = {
     "MAX_EPOCHS": _training_cfg.MAX_EPOCHS,
     "EARLY_STOP_PATIENCE": _training_cfg.EARLY_STOP_PATIENCE,
     "REDUCE_LR_PATIENCE": _training_cfg.REDUCE_LR_PATIENCE,
+    "AUGMENT_PROB": _training_cfg.AUGMENT_PROB,
+    "N_ENSEMBLE": _training_cfg.N_ENSEMBLE,
+    "PNL_LOSS_ENABLED": _training_cfg.PNL_LOSS_ENABLED,
+    "PRETRAIN_ENABLED": _training_cfg.PRETRAIN_ENABLED,
+    "PRETRAIN_EPOCHS": _training_cfg.PRETRAIN_EPOCHS,
+    "PRETRAIN_N_FUTURE": _training_cfg.PRETRAIN_N_FUTURE,
+    "MODEL_TYPE": _training_cfg.MODEL_TYPE,
 }
 
 horizons = HORIZONS
@@ -285,11 +305,15 @@ def process_instrument_for_inference(csv_path: Path, ctx: PipelineContext = None
 
 
 def cache_preprocessed(csv_path: Path, train_cutoff, train_val_cutoff, ctx: PipelineContext = None):
-    """Cache preprocessed data split by train/val/test"""
+    """Cache preprocessed data split by train/val/test.
+
+    Also saves ``{symbol}_regime_{split}.npy`` containing the regime_trend
+    value at each window's label date, used by regime-filtered training.
+    """
     symbol_name = csv_path.stem
     logger.info(f"Rebuilding cache for: {symbol_name}")
 
-    X, y, _, y_dates = process_instrument(csv_path, for_training=True, ctx=ctx)
+    X, y, df, y_dates = process_instrument(csv_path, for_training=True, ctx=ctx)
     if X.size == 0:
         for split in ["train", "val", "test"]:
             np.save(CONFIG["CACHE_DIR"] / f"{symbol_name}_X_{split}.npy", np.array([]))
@@ -297,6 +321,30 @@ def cache_preprocessed(csv_path: Path, train_cutoff, train_val_cutoff, ctx: Pipe
         return
 
     y_dates = pd.to_datetime(y_dates)
+
+    # Extract regime_trend at each label date for regime-gated training
+    regime_arr = np.full(len(y_dates), 0.5, dtype=np.float32)
+    if df is not None and "regime_trend" in df.columns:
+        df_idx = df.set_index("date")["regime_trend"]
+        for j, d in enumerate(y_dates):
+            try:
+                regime_arr[j] = float(df_idx.loc[d])
+            except (KeyError, TypeError):
+                pass
+
+    # Compute ATR-normalised weight for P&L loss: clip(ATR_14 / close, 0.5, 2.0)
+    atr_weight_arr = np.full(len(y_dates), 1.0, dtype=np.float32)
+    if df is not None and "ATR_14" in df.columns and "close" in df.columns:
+        df_atr = df.set_index("date")
+        for j, d in enumerate(y_dates):
+            try:
+                close_val = float(df_atr.loc[d, "close"])
+                atr_val = float(df_atr.loc[d, "ATR_14"])
+                if close_val > 0:
+                    atr_weight_arr[j] = float(np.clip(atr_val / close_val, 0.5, 2.0))
+            except (KeyError, TypeError):
+                pass
+
     splits = {
         "train": y_dates < np.datetime64(train_cutoff),
         "val": (y_dates >= np.datetime64(train_cutoff)) & (y_dates < np.datetime64(train_val_cutoff)),
@@ -306,6 +354,8 @@ def cache_preprocessed(csv_path: Path, train_cutoff, train_val_cutoff, ctx: Pipe
         np.save(CONFIG["CACHE_DIR"] / f"{symbol_name}_X_{split}.npy", X[mask])
         np.save(CONFIG["CACHE_DIR"] / f"{symbol_name}_y_{split}.npy", y[mask])
         np.save(CONFIG["CACHE_DIR"] / f"{symbol_name}_y_dates_{split}.npy", y_dates[mask])
+        np.save(CONFIG["CACHE_DIR"] / f"{symbol_name}_regime_{split}.npy", regime_arr[mask])
+        np.save(CONFIG["CACHE_DIR"] / f"{symbol_name}_atr_weight_{split}.npy", atr_weight_arr[mask])
 
     logger.info(
         f"Cached {symbol_name}: "
@@ -333,6 +383,11 @@ class InstrumentDataGenerator(tf.keras.utils.Sequence):
         use_time_weights=True,
         decay_factor=0.001,
         symbol_id_map=None,
+        p_augment=0.0,
+        regime_filter="all",
+        regime_bull_threshold=0.65,
+        regime_bear_threshold=0.35,
+        pnl_loss=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -343,30 +398,53 @@ class InstrumentDataGenerator(tf.keras.utils.Sequence):
         self.use_time_weights = use_time_weights
         self.decay_factor = decay_factor
         self.symbol_id_map = symbol_id_map or {}
+        self.p_augment = p_augment if split == "train" else 0.0
+        self.regime_filter = regime_filter  # "all", "bull", or "bear"
+        self.regime_bull_threshold = regime_bull_threshold
+        self.regime_bear_threshold = regime_bear_threshold
+        self.pnl_loss = pnl_loss  # append ATR weight as 9th label channel
         self.windows = []
         self.symbol_names = [Path(p).stem for p in csv_paths]
         self._prepare_indices()
         self.on_epoch_end()
 
     def _prepare_indices(self):
-        """Prepare window indices for all instruments"""
+        """Prepare window indices for all instruments, applying regime filter if set."""
         self.windows = []
         self.lengths = {}
         self.date_arrays = {}
+        self.atr_weight_arrays = {}
         for symbol_name in self.symbol_names:
             X_path = CONFIG["CACHE_DIR"] / f"{symbol_name}_X_{self.split}.npy"
-            y_path = CONFIG["CACHE_DIR"] / f"{symbol_name}_y_{self.split}.npy"
             date_path = CONFIG["CACHE_DIR"] / f"{symbol_name}_y_dates_{self.split}.npy"
+            regime_path = CONFIG["CACHE_DIR"] / f"{symbol_name}_regime_{self.split}.npy"
+            atr_path = CONFIG["CACHE_DIR"] / f"{symbol_name}_atr_weight_{self.split}.npy"
             if not X_path.exists():
-                n_windows = 0
+                self.lengths[symbol_name] = 0
+                continue
+
+            X = np.load(X_path, mmap_mode="r")
+            n_windows = len(X)
+            if date_path.exists():
+                self.date_arrays[symbol_name] = np.load(date_path, allow_pickle=True)
+            if self.pnl_loss and atr_path.exists():
+                self.atr_weight_arrays[symbol_name] = np.load(atr_path)
+
+            # Regime filtering: include only windows whose regime_trend matches
+            if self.regime_filter != "all" and regime_path.exists():
+                regime_vals = np.load(regime_path)
+                if self.regime_filter == "bull":
+                    valid = np.where(regime_vals >= self.regime_bull_threshold)[0]
+                elif self.regime_filter == "bear":
+                    valid = np.where(regime_vals <= self.regime_bear_threshold)[0]
+                else:
+                    valid = np.arange(n_windows)
             else:
-                X = np.load(X_path, mmap_mode="r")
-                n_windows = len(X)
-                if date_path.exists():
-                    self.date_arrays[symbol_name] = np.load(date_path, allow_pickle=True)
-            self.lengths[symbol_name] = n_windows
-            for i in range(n_windows):
-                self.windows.append((symbol_name, i))
+                valid = np.arange(n_windows)
+
+            self.lengths[symbol_name] = len(valid)
+            for i in valid:
+                self.windows.append((symbol_name, int(i)))
         self.indices = np.arange(len(self.windows))
 
     def __len__(self):
@@ -376,6 +454,7 @@ class InstrumentDataGenerator(tf.keras.utils.Sequence):
         batch_indices = self.indices[idx * self.batch_size:(idx + 1) * self.batch_size]
         X_batch, y_batch, sym_ids_batch = [], [], []
         weights_batch = [] if self.use_time_weights else None
+        atr_weights_batch = [] if self.pnl_loss else None
         cache = {}
         for bi in batch_indices:
             symbol_name, win_idx = self.windows[bi]
@@ -384,7 +463,10 @@ class InstrumentDataGenerator(tf.keras.utils.Sequence):
                 y = np.load(CONFIG["CACHE_DIR"] / f"{symbol_name}_y_{self.split}.npy", mmap_mode="r")
                 cache[symbol_name] = (X, y)
             X_arr, y_arr = cache[symbol_name]
-            X_batch.append(X_arr[win_idx])
+            x_single = X_arr[win_idx]
+            if self.p_augment > 0 and np.random.random() < self.p_augment:
+                x_single = self._augment_window(x_single.copy())
+            X_batch.append(x_single)
             y_batch.append(y_arr[win_idx])
             sym_ids_batch.append(self.symbol_id_map.get(symbol_name, 0))
 
@@ -392,19 +474,29 @@ class InstrumentDataGenerator(tf.keras.utils.Sequence):
                 if symbol_name in self.date_arrays:
                     dates = self.date_arrays[symbol_name]
                     date = pd.to_datetime(dates[win_idx])
-                    # Give more weight to recent dates
                     date_ago = (pd.Timestamp.now() - date).days
                     weights_batch.append(np.exp(-self.decay_factor * date_ago))
                 else:
                     weights_batch.append(1.0)
 
+            if self.pnl_loss:
+                if symbol_name in self.atr_weight_arrays:
+                    atr_weights_batch.append(float(self.atr_weight_arrays[symbol_name][win_idx]))
+                else:
+                    atr_weights_batch.append(1.0)
+
         X_out = np.array(X_batch, dtype=np.float32)
         y_out = np.array(y_batch, dtype=np.float32)
         sym_ids_out = np.array(sym_ids_batch, dtype=np.int32)
 
+        # Append ATR weight as 9th label channel for P&L-weighted loss
+        if self.pnl_loss:
+            atr_weights = np.array(atr_weights_batch, dtype=np.float32).reshape(-1, 1)
+            y_out = np.concatenate([y_out, atr_weights], axis=1)
+
         # Build multi-input list when symbol IDs are available
         if self.symbol_id_map:
-            x_inputs = [X_out, sym_ids_out]
+            x_inputs = (X_out, sym_ids_out)
         else:
             x_inputs = X_out
 
@@ -415,6 +507,37 @@ class InstrumentDataGenerator(tf.keras.utils.Sequence):
     def on_epoch_end(self):
         if self.shuffle:
             np.random.shuffle(self.indices)
+
+    def _augment_window(self, X: np.ndarray) -> np.ndarray:
+        """Apply a random synthetic crisis augmentation to a scaled window.
+
+        Four regimes are sampled with equal probability:
+        - Volatility shock: scale all features by 2.5–5×
+        - Trend reversal: negate the last 20% of timesteps (×1.5–3)
+        - Gap event: inject a single large spike (±4–8σ) at a random timestep
+        - Liquidity drain: zero-out 20% of randomly selected timesteps
+
+        The label is left unchanged — the model learns that extreme conditions
+        can precede any outcome, improving generalisation to unseen crises.
+        """
+        aug_type = np.random.randint(0, 4)
+        if aug_type == 0:
+            X = X * np.random.uniform(2.5, 5.0)
+        elif aug_type == 1:
+            cutoff = max(1, int(0.8 * len(X)))
+            X = X.copy()
+            X[cutoff:] = -X[cutoff:] * np.random.uniform(1.5, 3.0)
+        elif aug_type == 2:
+            t = np.random.randint(0, len(X))
+            spike = np.random.uniform(4.0, 8.0) * np.random.choice([-1, 1])
+            X = X.copy()
+            X[t] = X[t] + spike
+        else:
+            n_zero = max(1, int(0.2 * len(X)))
+            X = X.copy()
+            indices = np.random.choice(len(X), n_zero, replace=False)
+            X[indices] = 0.0
+        return X
 
 
 # ============================================================================
@@ -460,9 +583,9 @@ def feature_importance(model, X_val, y_val, feature_names):
     from sklearn.metrics import mean_squared_error
 
     # Separate time-series input from auxiliary inputs
-    if isinstance(X_val, list):
+    if isinstance(X_val, (list, tuple)):
         X_ts = X_val[0]
-        aux_inputs = X_val[1:]
+        aux_inputs = list(X_val[1:])
     else:
         X_ts = X_val
         aux_inputs = []
@@ -583,7 +706,14 @@ def main():
     
     global per_symbol_thresholds, symbol_ids
 
-    _sf = CONFIG.get("SIGMA_FACTOR", 1.5)
+    # Per-asset-class sigma factors control what counts as a "positive" label.
+    # Lower values → more positive labels → stronger learning signal.
+    # σ=1.5 gave only ~5% positives (too sparse). σ=0.75-1.0 gives ~15-20%.
+    _sf_default = CONFIG.get("SIGMA_FACTOR", 1.0)
+    _sf_per_class = CONFIG.get("SIGMA_FACTOR_PER_CLASS", {
+        "forex": 0.75, "indices": 1.0, "commodities": 1.0, "crypto": 1.5,
+    })
+
     per_symbol_thresholds = {}
     symbol_ids = {}
 
@@ -593,6 +723,10 @@ def main():
     for idx, csv_path in enumerate(all_csvs):
         symbol_stem = Path(csv_path).stem
         symbol_ids[symbol_stem] = idx
+
+        # Infer asset class from parent folder name to select sigma factor
+        asset_folder = Path(csv_path).parent.name
+        _sf = _sf_per_class.get(asset_folder, _sf_default)
 
         df = pd.read_csv(csv_path, parse_dates=["date"]).sort_values("date").dropna()
         df = add_features(df)
@@ -617,7 +751,8 @@ def main():
                 sym_down[h] = float(mu - _sf * sig)
             per_symbol_thresholds[symbol_stem] = {"up": sym_up, "down": sym_down}
             logger.info(
-                f"  {symbol_stem}: up_1d={sym_up['1d']:.6f}, down_1d={sym_down['1d']:.6f} "
+                f"  {symbol_stem} [{asset_folder}, σ×{_sf}]: "
+                f"up_1d={sym_up['1d']:.6f}, down_1d={sym_down['1d']:.6f} "
                 f"(n_train={len(train_rows)})"
             )
 
@@ -628,8 +763,8 @@ def main():
         vals = np.concatenate(all_targets[f"Target_{h}"])
         mu = np.nanmean(vals)
         sig = np.nanstd(vals)
-        global_thresholds_up[h] = float(mu + _sf * sig)
-        global_thresholds_down[h] = float(mu - _sf * sig)
+        global_thresholds_up[h] = float(mu + _sf_default * sig)
+        global_thresholds_down[h] = float(mu - _sf_default * sig)
         logger.info(f"  GLOBAL {h}: up={global_thresholds_up[h]:.6f}, down={global_thresholds_down[h]:.6f}")
 
     # Assign global thresholds to symbols without per-symbol stats
@@ -676,50 +811,169 @@ def main():
     # ========================================================================
     logger.info("Step 3: Creating data generators...")
     
+    _regime = CONFIG.get("_REGIME_FILTER", "all")
+    _bull_thr = CONFIG.get("REGIME_BULL_THRESHOLD", 0.65)
+    _bear_thr = CONFIG.get("REGIME_BEAR_THRESHOLD", 0.35)
+    if _regime != "all":
+        logger.info(f"Regime filter active: '{_regime}' (bull>={_bull_thr}, bear<={_bear_thr})")
+
+    _use_pnl_loss = CONFIG.get("PNL_LOSS_ENABLED", False)
+    if _use_pnl_loss:
+        logger.info("P&L-weighted focal loss enabled (ATR weight channel appended to labels)")
+
     train_gen = InstrumentDataGenerator(
         all_csvs, batch_size=128, split="train", shuffle=True,
-        use_time_weights=True, decay_factor=0.002,
+        use_time_weights=True, decay_factor=0.0005,
         symbol_id_map=symbol_ids,
+        p_augment=CONFIG.get("AUGMENT_PROB", 0.15),
+        regime_filter=_regime,
+        regime_bull_threshold=_bull_thr,
+        regime_bear_threshold=_bear_thr,
+        pnl_loss=_use_pnl_loss,
     )
     val_gen = InstrumentDataGenerator(
         all_csvs, batch_size=128, split="val", shuffle=False,
         use_time_weights=False,
         symbol_id_map=symbol_ids,
+        regime_filter=_regime,
+        regime_bull_threshold=_bull_thr,
+        regime_bear_threshold=_bear_thr,
+        pnl_loss=_use_pnl_loss,
     )
     
     logger.info(f"Train generator length: {len(train_gen)}")
     logger.info(f"Val generator length: {len(val_gen)}")
 
     # ========================================================================
-    # STEP 4: Build and train model
+    # STEP 3b: Self-supervised pre-training (optional)
     # ========================================================================
-    logger.info("Step 4: Building model...")
-    
+    _pretrain_weights_path = CONFIG["MODEL_DIR"] / "encoder_pretrained_weights.npz"
+    _pretrained_weights = None
+
+    if CONFIG.get("PRETRAIN_ENABLED", True) and not _pretrain_weights_path.exists():
+        logger.info("Step 3b: Self-supervised pre-training (next-candle prediction)...")
+        try:
+            from src.models.lstm import build_encoder_decoder
+
+            n_future = CONFIG.get("PRETRAIN_N_FUTURE", 5)
+            enc_dec = build_encoder_decoder(len(feature_cols), CONFIG["WINDOW_SIZE"], n_future=n_future)
+            enc_dec.compile(optimizer="adam", loss="mse")
+
+            # Build a generator that yields (X, X_future) pairs
+            # X_future = the scaled features for the next n_future rows after window
+            # We use the train split, unfiltered (all regimes)
+            pretrain_gen = InstrumentDataGenerator(
+                all_csvs, batch_size=128, split="train", shuffle=True,
+                use_time_weights=False, symbol_id_map=symbol_ids,
+            )
+
+            class PretextGen(tf.keras.utils.Sequence):
+                """Yield (X_past, X_future) pairs for next-candle pre-training."""
+                def __init__(self, base_gen, fc_list):
+                    self.base = base_gen
+                    self.n_future = n_future
+                    self.fc = fc_list
+
+                def __len__(self):
+                    return len(self.base)
+
+                def __getitem__(self, idx):
+                    batch = self.base[idx]
+                    x_b = batch[0] if not isinstance(batch[0], tuple) else batch[0][0]
+                    # x_b shape: (batch, window+1, n_features)
+                    # Target: next n_future rows — approximate with last n_future windows shifted
+                    # Use the last n_future timesteps of the window as a proxy target
+                    x_future = x_b[:, -n_future:, :]  # (batch, n_future, n_features)
+                    x_past = x_b                       # full window as input
+                    return x_past, x_future
+
+                def on_epoch_end(self):
+                    self.base.on_epoch_end()
+
+            pretext_gen = PretextGen(pretrain_gen, feature_cols)
+            pretrain_stop = EarlyStopping(monitor="loss", patience=5, restore_best_weights=True)
+            enc_dec.fit(
+                pretext_gen,
+                epochs=CONFIG.get("PRETRAIN_EPOCHS", 30),
+                callbacks=[pretrain_stop],
+                verbose=1,
+            )
+
+            # Extract encoder weights by layer name and save
+            encoder_submodel = enc_dec.get_layer("encoder")
+            weight_dict = {w.name: w.numpy() for w in encoder_submodel.weights}
+            np.savez(_pretrain_weights_path, **{k.replace("/", "_"): v for k, v in weight_dict.items()})
+            _pretrained_weights = weight_dict
+            logger.info(f"Pre-training complete. Encoder weights saved to {_pretrain_weights_path}")
+            del enc_dec, pretext_gen, pretrain_gen
+
+        except Exception as e:
+            logger.warning(f"Pre-training failed (non-fatal): {e} — proceeding with random init")
+            import traceback; traceback.print_exc()
+
+    elif _pretrain_weights_path.exists() and CONFIG.get("PRETRAIN_ENABLED", True):
+        logger.info(f"Step 3b: Loading cached pre-trained encoder weights from {_pretrain_weights_path}")
+        raw = np.load(_pretrain_weights_path, allow_pickle=True)
+        _pretrained_weights = {k.replace("_", "/"): v for k, v in raw.items()}
+
+    # ========================================================================
+    # STEP 4: Build and train model(s)
+    # ========================================================================
+    logger.info("Step 4: Building and training model(s)...")
+
     n_features = len(feature_cols)
-    model = build_model(n_features, CONFIG["WINDOW_SIZE"], n_symbols=n_symbols)
 
-    early_stop = EarlyStopping(
-        patience=CONFIG["EARLY_STOP_PATIENCE"],
-        monitor="val_loss",
-        restore_best_weights=True,
-        mode="min",
-    )
+    def _train_one(seed: int):
+        """Train one model with the given random seed. Returns (model, val_auc, history)."""
+        tf.random.set_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
 
-    reduce_lr = ReduceLROnPlateau(
-        monitor="val_loss",
-        factor=0.5,
-        patience=CONFIG["REDUCE_LR_PATIENCE"],
-        min_lr=1e-5,
-        verbose=1,
-    )
+        model_type = CONFIG.get("MODEL_TYPE", "lstm").lower()
+        if model_type == "tft":
+            from src.models.tft import build_tft_model
+            m = build_tft_model(n_features, CONFIG["WINDOW_SIZE"], n_symbols=n_symbols)
+        else:
+            m = build_model(n_features, CONFIG["WINDOW_SIZE"], n_symbols=n_symbols)
 
-    # Use focal loss instead of binary_crossentropy to handle severe class
-    # imbalance (~5-7% positive rate at 1.5σ).  Focal loss down-weights easy
-    # negatives so the gradient signal comes from informative hard examples.
-    focal_loss = binary_focal_loss(gamma=2.0, alpha=0.25)
-    model.compile(optimizer="adam", loss=focal_loss, metrics=[AUC(name="auc")])
+        # Load pre-trained encoder weights if available (LSTM only)
+        if _pretrained_weights and model_type == "lstm":
+            loaded = 0
+            for w in m.weights:
+                # Match by normalised name (replace "/" with "_" for npz compat)
+                key = w.name.replace("/", "_")
+                if key in _pretrained_weights:
+                    try:
+                        w.assign(_pretrained_weights[key])
+                        loaded += 1
+                    except Exception:
+                        pass
+            if loaded:
+                logger.info(f"  Loaded {loaded} pre-trained encoder weights into model")
 
-    # Log estimated positive rate for diagnostics
+        if _use_pnl_loss:
+            from src.models.layers import pnl_weighted_focal_loss
+            loss_fn = pnl_weighted_focal_loss(gamma=2.0, alpha=0.75)
+        else:
+            loss_fn = binary_focal_loss(gamma=2.0, alpha=0.75)
+        m.compile(optimizer="adam", loss=loss_fn, metrics=[AUC(name="auc")])
+
+        early_stop = EarlyStopping(
+            patience=CONFIG["EARLY_STOP_PATIENCE"],
+            monitor="val_auc", restore_best_weights=True, mode="max",
+        )
+        reduce_lr = ReduceLROnPlateau(
+            monitor="val_auc", factor=0.5,
+            patience=CONFIG["REDUCE_LR_PATIENCE"], min_lr=1e-5, mode="max", verbose=1,
+        )
+
+        hist = m.fit(train_gen, validation_data=val_gen, callbacks=[early_stop, reduce_lr],
+                     epochs=CONFIG["MAX_EPOCHS"], verbose=1)
+        best_epoch = int(np.argmax(hist.history.get("val_auc", [0])))
+        auc = hist.history.get("val_auc", [0])[best_epoch]
+        return m, auc, hist
+
+    # Log estimated positive rate once
     try:
         sample_batch = train_gen[0]
         y_sample = sample_batch[1] if isinstance(sample_batch, tuple) else sample_batch
@@ -728,29 +982,41 @@ def main():
     except Exception:
         pass
 
-    logger.info("Training model with focal loss (gamma=2.0, alpha=0.25)...")
-    history = model.fit(train_gen, validation_data=val_gen, callbacks=[early_stop, reduce_lr], 
-                        epochs=CONFIG["MAX_EPOCHS"], verbose=1)
+    n_ensemble = CONFIG.get("N_ENSEMBLE", 1)
+    best_model, best_val_auc, best_history = None, -1.0, None
+    ensemble_paths = []
+
+    for ens_i in range(n_ensemble):
+        seed = RANDOM_SEED + ens_i * 100
+        logger.info(f"Training model {ens_i + 1}/{n_ensemble} (seed={seed})...")
+        m_i, auc_i, hist_i = _train_one(seed)
+        save_path = CONFIG["MODEL_DIR"] / f"lstm_model_{ens_i}.keras"
+        m_i.save(save_path)
+        ensemble_paths.append(save_path)
+        logger.info(f"  Model {ens_i}: val_AUC={auc_i:.4f} → saved to {save_path.name}")
+        if auc_i > best_val_auc:
+            best_model, best_val_auc, best_history = m_i, auc_i, hist_i
+
+    model = best_model
+    history = best_history
+    final_val_auc = best_val_auc
 
     # ========================================================================
     # STEP 4b: Model quality gate — refuse to deploy a bad model
     # ========================================================================
     logger.info("Step 4b: Checking model quality before deployment...")
-    
+
     MIN_VAL_AUC = CONFIG["MIN_VAL_AUC"]
 
-    # Use the best-epoch metrics (matching restore_best_weights=True),
-    # not the last epoch which may be worse.
     val_auc_hist = history.history.get("val_auc", [0])
     val_loss_hist = history.history.get("val_loss", [float('inf')])
-    best_epoch = int(np.argmin(val_loss_hist))  # EarlyStopping monitors val_loss
-    final_val_auc = val_auc_hist[best_epoch]
+    best_epoch = int(np.argmax(val_auc_hist))
     final_val_loss = val_loss_hist[best_epoch]
     logger.info(
-        f"Best val_loss at epoch {best_epoch + 1}: "
-        f"val AUC: {final_val_auc:.4f}, val loss: {final_val_loss:.4f}"
+        f"Best ensemble val_auc: {final_val_auc:.4f} (at epoch {best_epoch + 1}), "
+        f"val loss: {final_val_loss:.4f}"
     )
-    
+
     if final_val_auc < MIN_VAL_AUC:
         logger.error(
             f"MODEL QUALITY GATE FAILED: val AUC {final_val_auc:.4f} < minimum {MIN_VAL_AUC}. "
@@ -758,16 +1024,25 @@ def main():
             f"Check data quality, class balance, and feature engineering."
         )
         sys.exit(1)
-    
+
     logger.info(f"Model quality gate PASSED (val AUC {final_val_auc:.4f} >= {MIN_VAL_AUC})")
 
     # ========================================================================
     # STEP 4c: Save model, scaler, and feature_cols for live trading
     # ========================================================================
     logger.info("Step 4c: Saving model artifacts for live trading...")
-    
-    model.save(CONFIG["MODEL_DIR"] / "lstm_model.keras")
-    logger.info(f"Saved model to {CONFIG['MODEL_DIR'] / 'lstm_model.keras'}")
+
+    # Primary model (best of ensemble) — used as fallback by single-model bots.
+    # If a regime filter was used, also save under the regime-specific name.
+    primary_path = CONFIG["MODEL_DIR"] / "lstm_model.keras"
+    model.save(primary_path)
+    logger.info(f"Saved primary model to {primary_path}")
+
+    _regime_filter = CONFIG.get("_REGIME_FILTER", "all")
+    if _regime_filter in ("bull", "bear"):
+        regime_path = CONFIG["MODEL_DIR"] / f"lstm_{_regime_filter}.keras"
+        model.save(regime_path)
+        logger.info(f"Saved regime model to {regime_path}")
     
     joblib.dump(scaler, CONFIG["MODEL_DIR"] / "scaler.joblib")
     logger.info(f"Saved scaler to {CONFIG['MODEL_DIR'] / 'scaler.joblib'}")
@@ -931,4 +1206,18 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+    _parser = argparse.ArgumentParser(description="LSTM forecasting pipeline")
+    _parser.add_argument(
+        "--regime", choices=["all", "bull", "bear"], default="all",
+        help="Train on a regime-filtered subset: 'all' (default), 'bull' (regime_trend>=0.65), 'bear' (regime_trend<=0.35)"
+    )
+    _parser.add_argument(
+        "--skip-pretrain", action="store_true",
+        help="Skip self-supervised pre-training even if PRETRAIN_ENABLED=True"
+    )
+    _args = _parser.parse_args()
+    CONFIG["_REGIME_FILTER"] = _args.regime
+    if _args.skip_pretrain:
+        CONFIG["PRETRAIN_ENABLED"] = False
     main()

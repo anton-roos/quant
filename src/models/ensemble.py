@@ -54,14 +54,18 @@ class EnsemblePredictor:
         self.models = []
         self._mc_fns = []
 
-        focal_loss = binary_focal_loss(gamma=2.0, alpha=0.25)
+        focal_loss = binary_focal_loss(gamma=2.0, alpha=0.75)
         custom_objects = {"MCDropout": MCDropout, "binary_focal_loss": focal_loss}
 
         if model_paths:
             paths = [Path(p) for p in model_paths]
         else:
             d = Path(model_dir) if model_dir else PROJECT_ROOT / "outputs" / "models"
-            paths = sorted(d.glob("*model*.keras"))
+            # Load numbered ensemble models: lstm_model_0.keras, lstm_model_1.keras, …
+            paths = sorted(d.glob("lstm_model_[0-9]*.keras"))
+            if not paths:
+                # Fall back to any *model*.keras
+                paths = sorted(d.glob("*model*.keras"))
 
         if not paths:
             logger.warning("No ensemble model files found — single-model mode")
@@ -71,8 +75,12 @@ class EnsemblePredictor:
             try:
                 m = load_model(str(p), custom_objects=custom_objects)
                 self.models.append(m)
-                self._mc_fns.append(tf.function(lambda x, _m=m: _m(x, training=True)))
-                logger.info(f"Ensemble: loaded {p.name}")
+                has_sym = len(m.inputs) > 1
+                if has_sym:
+                    self._mc_fns.append(tf.function(lambda x, s, _m=m: _m([x, s], training=True)))
+                else:
+                    self._mc_fns.append(tf.function(lambda x, s, _m=m: _m(x, training=True)))
+                logger.info(f"Ensemble: loaded {p.name} (multi-input={has_sym})")
             except Exception as e:
                 logger.warning(f"Ensemble: failed to load {p.name}: {e}")
 
@@ -86,36 +94,43 @@ class EnsemblePredictor:
         self,
         X: np.ndarray,
         mc_samples: int = 50,
+        symbol_ids: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray, float]:
         """Run MC-Dropout inference across all ensemble members.
+
+        Parameters
+        ----------
+        X : ndarray, shape (batch, window+1, n_features)
+        mc_samples : int
+            Number of MC-Dropout forward passes per model.
+        symbol_ids : ndarray, shape (batch, 1), optional
+            Integer symbol IDs for models with embedding inputs.
 
         Returns
         -------
         mean_probs : ndarray, shape (batch, n_outputs)
-            Mean predicted probability across all models and MC samples.
         std_probs : ndarray, shape (batch, n_outputs)
-            Standard deviation across all models and MC samples.
         disagreement : float
-            Mean pairwise standard deviation between model means
-            (0 = perfect agreement, higher = models disagree).
+            Std of per-model means (0 = full consensus, higher = disagreement).
         """
         if not self.models:
             raise RuntimeError("No models loaded for ensemble prediction")
 
-        all_preds = []  # shape will be (n_models * mc_samples, batch, n_outputs)
+        import tensorflow as tf
+        sym = symbol_ids if symbol_ids is not None else np.zeros((X.shape[0], 1), dtype=np.int32)
+
+        all_preds = []
         per_model_means = []
 
         for fn in self._mc_fns:
-            model_preds = np.array([fn(X).numpy() for _ in range(mc_samples)])
+            model_preds = np.array([fn(X, sym).numpy() for _ in range(mc_samples)])
             all_preds.append(model_preds)
             per_model_means.append(model_preds.mean(axis=0))
 
-        # Stack all predictions
-        stacked = np.concatenate(all_preds, axis=0)  # (total_samples, batch, n_outputs)
+        stacked = np.concatenate(all_preds, axis=0)
         mean_probs = stacked.mean(axis=0)
         std_probs = stacked.std(axis=0)
 
-        # Model disagreement: std of per-model means
         if len(per_model_means) > 1:
             model_means = np.stack(per_model_means, axis=0)
             disagreement = float(model_means.std(axis=0).mean())

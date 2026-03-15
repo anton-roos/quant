@@ -81,14 +81,17 @@ def prepare_features(
 def mc_predict(model_fn, X: np.ndarray, n_samples: int, symbol_id: int = None) -> Tuple[np.ndarray, np.ndarray]:
     """Run MC-Dropout inference and return ``(mean_probs, std_probs)``.
 
+    Calls the model with ``training=True`` so Dropout layers remain active,
+    enabling Monte-Carlo uncertainty estimation.
+
     When ``symbol_id`` is not None the model is called with multi-input
     ``(X, sym_ids)`` to leverage the learned symbol embedding.
     """
     if symbol_id is not None:
         sym_ids = np.array([[symbol_id]], dtype=np.int32)
-        preds = np.array([model_fn(X, sym_ids).numpy() for _ in range(n_samples)])
+        preds = np.array([model_fn(X, sym_ids, training=True).numpy() for _ in range(n_samples)])
     else:
-        preds = np.array([model_fn(X).numpy() for _ in range(n_samples)])
+        preds = np.array([model_fn(X, training=True).numpy() for _ in range(n_samples)])
     return preds.mean(axis=0), preds.std(axis=0)
 
 

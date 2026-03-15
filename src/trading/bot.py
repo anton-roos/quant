@@ -39,7 +39,11 @@ import tensorflow as tf
 from keras.models import load_model
 
 from src.models.layers import MCDropout, binary_focal_loss
+from src.models.ensemble import EnsemblePredictor
 from src.models.calibration import load_calibrator, calibrate
+from src.data.calendar import CalendarFilter
+from src.trading.pairs_trader import PairsTrader
+from src.models.gnn import CrossAssetGNN, build_correlation_adj
 from src.models.uncertainty import composite_confidence, predictive_entropy
 from src.utils.constants import sanitize_filename, CATEGORY_TYPE_TO_FOLDER
 from src.utils.datetime_utils import parse_iso_datetime_to_utc
@@ -220,6 +224,9 @@ class TradingBot:
 
         # Load model artifacts
         self.model = None
+        self.ensemble: Optional[EnsemblePredictor] = None
+        self.model_bull = None   # Regime-specialist: bull markets
+        self.model_bear = None   # Regime-specialist: bear markets
         self.scaler = None
         self.feature_cols: List[str] = []
         self.symbol_ids: Dict[str, int] = {}   # symbol_stem -> int ID for embedding
@@ -228,6 +235,22 @@ class TradingBot:
 
         self._load_artifacts()
         self._load_symbols()
+
+        # Economic calendar filter
+        self.calendar = CalendarFilter(self.config, symbols=self.symbols)
+
+        # Cointegration pairs trading overlay
+        self.pairs_trader = PairsTrader(self.config, mt5_client=self.mt5)
+        self._last_pairs_scan: Optional[datetime] = None
+
+        # GNN for cross-asset contagion (optional)
+        self._gnn: Optional[CrossAssetGNN] = None
+        if self.config.get("GNN_ENABLED", False):
+            self._gnn = CrossAssetGNN(hidden_dim=8, dropout_rate=0.1)
+            gnn_weights_path = PROJECT_ROOT / "outputs" / "models" / "gnn_weights.npz"
+            self._gnn.load_weights(gnn_weights_path)
+            logger.info("GNN overlay loaded")
+        self._price_cache: Dict[str, np.ndarray] = {}  # for adj matrix
 
         # Calibrator (Platt / Isotonic — loaded if available)
         self.calibrator = load_calibrator()
@@ -275,9 +298,31 @@ class TradingBot:
             raise FileNotFoundError(f"Feature cols not found at {features_path}")
 
         logger.info("Loading model...")
-        focal_loss = binary_focal_loss(gamma=2.0, alpha=0.25)
+        focal_loss = binary_focal_loss(gamma=2.0, alpha=0.75)
         self.model = load_model(model_path, custom_objects={"MCDropout": MCDropout, "binary_focal_loss": focal_loss})
         logger.info(f"Model loaded: {model_path}")
+
+        # Load ensemble if multiple numbered models exist (lstm_model_0.keras, …)
+        model_dir = model_path.parent
+        ensemble_paths = sorted(model_dir.glob("lstm_model_[0-9]*.keras"))
+        if len(ensemble_paths) >= 2:
+            self.ensemble = EnsemblePredictor(model_paths=[str(p) for p in ensemble_paths])
+            logger.info(f"Ensemble loaded: {self.ensemble.n_models} models")
+        else:
+            self.ensemble = None
+            logger.info("Single-model mode (no numbered ensemble files found)")
+
+        # Load regime-specialist models if available
+        custom = {"MCDropout": MCDropout, "binary_focal_loss": focal_loss}
+        for regime in ("bull", "bear"):
+            rpath = model_dir / f"lstm_{regime}.keras"
+            if rpath.exists():
+                try:
+                    m = load_model(rpath, custom_objects=custom)
+                    setattr(self, f"model_{regime}", m)
+                    logger.info(f"Regime model loaded: {rpath.name}")
+                except Exception as e:
+                    logger.warning(f"Could not load regime model {rpath.name}: {e}")
 
         # Try joblib first, fall back to pickle for legacy scaler.pkl files
         if scaler_path.suffix == ".joblib" or scaler_path.exists():
@@ -529,32 +574,53 @@ class TradingBot:
 
         return X, df
 
-    def _mc_predict(self, X: np.ndarray, symbol_id: int = 0) -> Tuple[np.ndarray, np.ndarray]:
-        """Run MC Dropout inference and return (mean_probs, std_probs).
+    def _mc_predict(
+        self, X: np.ndarray, symbol_id: int = 0, regime_trend: float = 0.5
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        """Run MC Dropout inference and return (mean_probs, std_probs, disagreement).
 
-        If a calibrator is loaded, probabilities are calibrated.
-        Uses tf.function-compiled forward pass for speed.
+        Uses EnsemblePredictor when available.  When regime-specialist models
+        exist and REGIME_ROUTING_ENABLED is True, routes to bull/bear/all model
+        based on ``regime_trend``.
 
         Parameters
         ----------
         X : ndarray, shape (1, window+1, n_features)
         symbol_id : int
-            Integer ID for the symbol embedding input (ignored when
-            the model has no embedding layer).
+        regime_trend : float  (0–1; >0.65 = bull, <0.35 = bear)
         """
         n_samples = self.config["MC_DROPOUT_SAMPLES"]
-        if self._model_has_symbol_input:
-            sym_ids = np.array([[symbol_id]], dtype=np.int32)
-            preds = np.array([self._mc_predict_fn(X, sym_ids).numpy() for _ in range(n_samples)])
+        sym_ids = np.array([[symbol_id]], dtype=np.int32)
+        bull_thr = self.config.get("REGIME_BULL_THRESHOLD", 0.65)
+        bear_thr = self.config.get("REGIME_BEAR_THRESHOLD", 0.35)
+
+        # Select regime-specialist model if routing is enabled and model exists
+        routed_model = None
+        if self.config.get("REGIME_ROUTING_ENABLED", True):
+            if regime_trend >= bull_thr and self.model_bull is not None:
+                routed_model = self.model_bull
+            elif regime_trend <= bear_thr and self.model_bear is not None:
+                routed_model = self.model_bear
+
+        if self.ensemble is not None and self.ensemble.n_models >= 2 and routed_model is None:
+            mean_probs, std_probs, disagreement = self.ensemble.predict(
+                X, mc_samples=n_samples, symbol_ids=sym_ids,
+            )
         else:
-            preds = np.array([self._mc_predict_fn(X).numpy() for _ in range(n_samples)])
-        mean_probs = preds.mean(axis=0)
-        std_probs = preds.std(axis=0)
+            active_model = routed_model if routed_model is not None else self.model
+            has_sym = len(active_model.inputs) > 1
+            if has_sym:
+                fn = tf.function(lambda x, s, _m=active_model: _m([x, s], training=True))
+                preds = np.array([fn(X, sym_ids).numpy() for _ in range(n_samples)])
+            else:
+                fn = tf.function(lambda x, _m=active_model: _m(x, training=True))
+                preds = np.array([fn(X).numpy() for _ in range(n_samples)])
+            mean_probs = preds.mean(axis=0)
+            std_probs = preds.std(axis=0)
+            disagreement = 0.0
 
-        # Apply calibration if available
         mean_probs = calibrate(self.calibrator, mean_probs)
-
-        return mean_probs, std_probs
+        return mean_probs, std_probs, disagreement
 
     def _compute_confidence(self, mean_probs: np.ndarray, std_probs: np.ndarray) -> np.ndarray:
         """Compute composite confidence score for predictions."""
@@ -629,7 +695,15 @@ class TradingBot:
             # Look up the symbol's integer ID for the embedding input
             symbol_stem = f"{safe_name}_daily_processed"
             sym_id = self.symbol_ids.get(symbol_stem, 0)
-            mean_probs, std_probs = self._mc_predict(X, symbol_id=sym_id)
+            # Cache price series for GNN adj matrix computation
+            if self._gnn is not None:
+                self._price_cache[mt5_name] = df
+
+            # Read regime_trend before calling _mc_predict so routing works
+            latest_regime_trend = float(df["regime_trend"].iloc[-1]) if "regime_trend" in df.columns else 0.5
+            mean_probs, std_probs, disagreement = self._mc_predict(
+                X, symbol_id=sym_id, regime_trend=latest_regime_trend
+            )
 
             # Get the latest close and ATR for position sizing
             latest_close = float(df["close"].iloc[-1])
@@ -651,6 +725,15 @@ class TradingBot:
                         )
                         continue
 
+            # --- Ensemble consensus gate ---
+            consensus_threshold = self.config.get("ENSEMBLE_CONSENSUS_THRESHOLD", 0.06)
+            if self.ensemble is not None and disagreement > consensus_threshold:
+                logger.debug(
+                    f"  {mt5_name}: ensemble disagreement {disagreement:.4f} > "
+                    f"{consensus_threshold} — skipping"
+                )
+                continue
+
             diag_evaluated += 1
             sym_best_buy = 0.0
             sym_best_sell = 0.0
@@ -667,7 +750,8 @@ class TradingBot:
 
                 # Use separate threshold for BUY signals (fallback to MIN_ACCEPTED for backward compat)
                 min_threshold_buy = self.config.get("MIN_ACCEPTED_BUY", self.config["MIN_ACCEPTED"])
-                if adj_prob > min_threshold_buy:
+                min_confidence = self.config.get("MIN_CONFIDENCE", 0.0)
+                if adj_prob > min_threshold_buy and conf_buy >= min_confidence:
                     candidates.append({
                         "symbol": safe_name,
                         "mt5_name": mt5_name,
@@ -681,6 +765,7 @@ class TradingBot:
                         "close": latest_close,
                         "atr": latest_atr,
                         "type": sym.get("type", "Unknown"),
+                        "regime_trend": latest_regime_trend,
                     })
                     self._log_confidence(safe_name, "BUY", h, adj_prob, conf_buy, pred_std)
                 else:
@@ -697,7 +782,7 @@ class TradingBot:
 
                 # Use separate threshold for SELL signals (fallback to MIN_ACCEPTED for backward compat)
                 min_threshold_sell = self.config.get("MIN_ACCEPTED_SELL", self.config["MIN_ACCEPTED"])
-                if adj_prob_down > min_threshold_sell:
+                if adj_prob_down > min_threshold_sell and conf_sell >= min_confidence:
                     candidates.append({
                         "symbol": safe_name,
                         "mt5_name": mt5_name,
@@ -711,6 +796,7 @@ class TradingBot:
                         "close": latest_close,
                         "atr": latest_atr,
                         "type": sym.get("type", "Unknown"),
+                        "regime_trend": latest_regime_trend,
                     })
                     self._log_confidence(safe_name, "SELL", h, adj_prob_down, conf_sell, pred_std_down)
                 else:
@@ -742,18 +828,84 @@ class TradingBot:
                 + ", ".join(f"{name}={val:.4f}" for name, val in top5_sell)
             )
 
+        # GNN enrichment: smooth adj_probs across correlated instruments
+        if self._gnn is not None and candidates:
+            try:
+                self._apply_gnn_enrichment(candidates)
+            except Exception as e:
+                logger.warning(f"GNN enrichment failed (non-fatal): {e}")
+
         # Apply horizon weights to ranking score, boosted by composite confidence
         horizon_weights = self.config.get("HORIZON_WEIGHTS", {"1d": 1.5, "1w": 1.2, "1m": 1.0, "6m": 0.6})
         conf_weight = self.config.get("CONFIDENCE_SCORE_WEIGHT", 0.3)
         for c in candidates:
             hw = horizon_weights.get(c["horizon"], 1.0)
             conf = c.get("confidence", 0.5)
-            # weighted_score = adj_prob * horizon_weight * (1 + confidence_weight * confidence)
             c["weighted_score"] = c["adj_prob"] * hw * (1.0 + conf_weight * conf)
 
         # Sort by weighted score descending (best signals first)
         candidates.sort(key=lambda x: x["weighted_score"], reverse=True)
         return candidates
+
+    def _apply_gnn_enrichment(self, candidates: List[Dict]) -> None:
+        """Enrich adj_probs using cross-asset GNN message passing.
+
+        Builds a per-symbol adj_prob feature vector, passes all symbols
+        through the GNN simultaneously, then updates each candidate's
+        adj_prob with the GNN-smoothed value (blended 70% original / 30% GNN).
+        """
+        processed_base = PROJECT_ROOT / self.config["PROCESSED_DIR"]
+        sym_names = list({c["mt5_name"] for c in candidates})
+
+        # Collect price series for adj matrix
+        price_dict: Dict[str, np.ndarray] = {}
+        for sym in self.symbols:
+            name = sym["name"]
+            df = self._price_cache.get(name)
+            if df is not None and "close" in df.columns:
+                price_dict[name] = df["close"].values
+
+        if len(price_dict) < 3:
+            return
+
+        adj, names_ordered = build_correlation_adj(
+            price_dict,
+            threshold=self.config.get("GNN_CORR_THRESHOLD", 0.6),
+            lookback=self.config.get("GNN_LOOKBACK", 60),
+        )
+
+        if len(names_ordered) == 0:
+            return
+
+        # Build node feature matrix: (n_instruments, 8) = adj_probs per horizon/side
+        # For instruments not in candidates, use 0.5 (neutral)
+        name_to_idx = {n: i for i, n in enumerate(names_ordered)}
+        n = len(names_ordered)
+        node_features = np.full((n, 8), 0.5, dtype=np.float32)
+
+        for c in candidates:
+            idx = name_to_idx.get(c["mt5_name"])
+            if idx is None:
+                continue
+            # Place adj_prob in the appropriate horizon slot
+            from src.utils.constants import HORIZONS
+            h_idx = HORIZONS.index(c["horizon"]) if c["horizon"] in HORIZONS else 0
+            offset = 0 if c["side"] == "BUY" else 4
+            node_features[idx, offset + h_idx] = c["adj_prob"]
+
+        # Run GNN
+        enriched = self._gnn(node_features, adj)  # (n, 8)
+
+        # Blend: 70% original + 30% GNN
+        blend = 0.3
+        for c in candidates:
+            idx = name_to_idx.get(c["mt5_name"])
+            if idx is None:
+                continue
+            h_idx = HORIZONS.index(c["horizon"]) if c["horizon"] in HORIZONS else 0
+            offset = 0 if c["side"] == "BUY" else 4
+            gnn_prob = float(np.clip(enriched[idx, offset + h_idx], 0.0, 1.0))
+            c["adj_prob"] = (1 - blend) * c["adj_prob"] + blend * gnn_prob
 
     # ------------------------------------------------------------------
     # Risk management & position sizing
@@ -876,8 +1028,13 @@ class TradingBot:
     def _compute_sl_tp(
         self, side: str, close: float, atr: float, digits: int,
         horizon: str = "1w",
+        regime_trend: float = 0.5,
     ) -> Tuple[Optional[float], Optional[float]]:
-        """Compute SL and TP based on ATR, scaled by signal horizon."""
+        """Compute SL and TP based on ATR, scaled by signal horizon and market regime.
+
+        In trending regimes (regime_trend=1) the TP is widened to run profits;
+        in ranging regimes (regime_trend=0) it is tightened to capture quicker moves.
+        """
         if atr <= 0:
             return None, None
 
@@ -885,8 +1042,16 @@ class TradingBot:
         sl_scale = self.config.get("HORIZON_SL_SCALE", {}).get(horizon, 1.0)
         tp_scale = self.config.get("HORIZON_TP_SCALE", {}).get(horizon, 1.0)
 
+        # Regime-adaptive TP scaling: trending → wider, ranging → tighter
+        if regime_trend >= 0.7:
+            regime_tp_scale = 1.5
+        elif regime_trend <= 0.3:
+            regime_tp_scale = 0.75
+        else:
+            regime_tp_scale = 1.0
+
         sl_dist = atr * self.config["ATR_SL_MULTIPLIER"] * sl_scale
-        tp_dist = atr * self.config["ATR_TP_MULTIPLIER"] * tp_scale
+        tp_dist = atr * self.config["ATR_TP_MULTIPLIER"] * tp_scale * regime_tp_scale
 
         if side == "BUY":
             sl = round(close - sl_dist, digits)
@@ -1181,7 +1346,7 @@ class TradingBot:
                 continue
 
             X, df = result
-            mean_probs, std_probs = self._mc_predict(X)
+            mean_probs, std_probs, _ = self._mc_predict(X)
 
             # Best adj_prob for BUY side (horizons 0..3) and SELL side (4..7)
             n_horizons = 4
@@ -1399,7 +1564,7 @@ class TradingBot:
             logger.error(f"Failed to get account info: {e}")
             return
 
-        # 5. Generate signals
+        # 5. Generate signals (directional LSTM + pairs overlay)
         try:
             candidates = self.generate_signals()
             logger.info(f"Signal scan complete: {len(candidates)} candidates above threshold")
@@ -1409,6 +1574,30 @@ class TradingBot:
             if self.config.get("NOTIFY_ON_ERROR", True):
                 self.notifier.send(f"⚠️ Signal generation failed: {e}")
             return
+
+        # Pairs trading scan (weekly) + signal injection
+        if self.config.get("PAIRS_TRADING_ENABLED", False):
+            try:
+                scan_interval = self.config.get("PAIRS_SCAN_INTERVAL_DAYS", 7)
+                now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+                if (self._last_pairs_scan is None or
+                        (now_dt - self._last_pairs_scan).days >= scan_interval):
+                    processed_base = PROJECT_ROOT / self.config["PROCESSED_DIR"]
+                    self.pairs_trader.scan_pairs(processed_base, self.symbols)
+                    self._last_pairs_scan = now_dt
+
+                processed_base = PROJECT_ROOT / self.config["PROCESSED_DIR"]
+                pairs_signals = self.pairs_trader.get_signals(processed_base, self.symbols)
+                if pairs_signals:
+                    logger.info(f"Pairs overlay: {len(pairs_signals)} signals")
+                    # Pairs signals are handled differently — skip for now and log only
+                    for ps in pairs_signals:
+                        logger.info(
+                            f"  PAIRS: {ps['sym1']}/{ps['sym2']} "
+                            f"{ps['side1']}/{ps['side2']} z={ps['zscore']:.2f}"
+                        )
+            except Exception as e:
+                logger.warning(f"Pairs trading scan failed: {e}")
 
         if not candidates:
             logger.info("No trade candidates today")
@@ -1462,6 +1651,11 @@ class TradingBot:
             atr = candidate["atr"]
             side = candidate["side"]
 
+            # --- Economic calendar gate ---
+            if self.calendar.is_blocked(mt5_name):
+                logger.info(f"  Skipping {mt5_name} — blocked by economic calendar")
+                continue
+
             # --- Spread / liquidity gate ---
             try:
                 live_quote = self.mt5.quote(mt5_name)
@@ -1483,9 +1677,10 @@ class TradingBot:
                 logger.debug(f"  Quote failed for {mt5_name}: {e}, using daily close")
                 live_price = candidate["close"]
 
-            # Compute SL/TP from live price (horizon-aware)
+            # Compute SL/TP from live price (horizon and regime-aware)
             sl, tp = self._compute_sl_tp(side, live_price, atr, digits,
-                                         horizon=candidate["horizon"])
+                                         horizon=candidate["horizon"],
+                                         regime_trend=candidate.get("regime_trend", 0.5))
 
             # Compute lot size
             lot_size = self._compute_lot_size(sym_info, atr, live_price,
@@ -1626,6 +1821,12 @@ class TradingBot:
                     except Exception as e:
                         logger.error(f"Data refresh failed: {e}")
 
+                    # Refresh economic calendar once per day
+                    try:
+                        self.calendar.try_refresh()
+                    except Exception as e:
+                        logger.warning(f"Calendar refresh failed: {e}")
+
                     # Walk-forward retrain check (once per day after data refresh)
                     if self.config.get("RETRAIN_ENABLED", False):
                         self._maybe_retrain()
@@ -1711,7 +1912,14 @@ class TradingBot:
                 logger.info("New model deployed — reloading artifacts...")
                 self._load_artifacts()
                 # Re-compile tf.function with new model
-                self._mc_predict_fn = tf.function(lambda x: self.model(x, training=True))
+                self._model_has_symbol_input = len(self.model.inputs) > 1
+                if self._model_has_symbol_input:
+                    @tf.function
+                    def _mc_fn(ts_input, sym_input):
+                        return self.model([ts_input, sym_input], training=True)
+                    self._mc_predict_fn = _mc_fn
+                else:
+                    self._mc_predict_fn = tf.function(lambda x: self.model(x, training=True))
                 if self.config.get("NOTIFY_ON_TRADE", True):
                     self.notifier.send("✅ New model deployed and loaded")
             else:

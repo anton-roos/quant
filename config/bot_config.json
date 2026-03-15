@@ -8,9 +8,10 @@
     "FEATURES_PATH": "outputs/models/feature_cols.json",
     "SYMBOLS_PATH": "config/symbols.json",
 
-    "MIN_ACCEPTED": 0.10,
-    "MIN_ACCEPTED_BUY": 0.10,
-    "MIN_ACCEPTED_SELL": 0.04,
+    "MIN_ACCEPTED": 0.28,
+    "MIN_ACCEPTED_BUY": 0.28,
+    "MIN_ACCEPTED_SELL": 0.28,
+    "MIN_CONFIDENCE": 0.35,
     "STD_FACTOR": 0.25,
     "MC_DROPOUT_SAMPLES": 50,
     "WINDOW_SIZE": 90,
